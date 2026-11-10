@@ -1,19 +1,24 @@
 import sys
 sys.dont_write_bytecode = True
 
+import base64
 import collections
+import csv
 import copy
 import contextlib
 import ctypes as C
 import datetime
+import difflib
 import functools
 import heapq
 import hashlib
 import hmac
 import importlib
+import io
 import json
 import math
 import os
+import subprocess
 from pathlib import Path
 import queue
 import random
@@ -22,6 +27,7 @@ import sqlite3
 import stat
 import sysconfig
 import shutil
+import struct
 import tempfile
 import threading
 import time
@@ -31,8 +37,10 @@ import uuid
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 
 
+STATE_ENCODING_VERSION = "spatial-v3"
 APP_NAME = "通用游戏 Agent · 鼠标与键盘自主学习"
 MINIMUM_PYTHON = (3, 10)
 WINDOW_GEOMETRY = "1080x780"
@@ -44,12 +52,13 @@ UI_COMPACT_MIN_WIDTH = 480
 UI_COMPACT_MIN_HEIGHT = 420
 UI_PREVIEW_LABEL_HEIGHT = 28
 UI_PREVIEW_MIN_HEIGHT = 160
-UI_METRIC_COLUMNS = 4
+UI_METRIC_COLUMNS = 5
 UI_LOG_VISIBLE_ROWS = 8
 UI_LOG_VISIBLE_COLUMNS = 36
 UI_PREVIEW_PLACEHOLDER_MARGIN = 14
-UI_METRIC_COMPACT_COLUMNS = 2
+UI_METRIC_COMPACT_COLUMNS = 3
 UI_COMPACT_METRIC_COUNT = 4
+UI_COMPACT_METRIC_EXTRA = 2
 UI_DEMONSTRATION_LOG_INTERVAL = 8
 UI_METRIC_COMPACT_WIDTH = 940
 UI_PANEL_STACK_WIDTH = 850
@@ -74,7 +83,6 @@ UI_THEME_REFRESH_SECONDS = 2.0
 UI_TARGET_DISCOVERY_SECONDS = 0.9
 TD_DISCOUNT = 0.82
 TD_LEARNING_RATE = 0.30
-TD_LEARNING_RATE_DECAY = 0.10
 TD_ACTION_WEIGHT = 0.42
 TD_TRACE_DEPTH = 5
 TD_TRACE_DECAY = 0.60
@@ -327,6 +335,27 @@ DB_WAL_PAGES = 256
 DB_CACHE_KIB = 8192
 BLACKBOX_JSON_INDENT = 2
 BLACKBOX_RECENT_EVENT_LIMIT = 512
+BLACKBOX_BUNDLE_VERSION = 2
+BLACKBOX_EVENT_BATCH = EVENT_PRUNE_INTERVAL
+BLACKBOX_STREAM_CHUNK_BYTES = 128 * 1024
+BLACKBOX_SNAPSHOT_PROGRESS_SHARE = 11
+BLACKBOX_PROBE_MAX_BYTES = 16 * 1024 * 1024
+BLACKBOX_ACTION_CSV_COLUMNS = (
+    'id', 'time', 'index', 'game_id', 'context', 'coarse_context', 'next_coarse_context',
+    'action', 'control_mode', 'decision_source', 'active_objective', 'planning_goal',
+    'visual_reward', 'visual_effect', 'goal_feedback', 'goal_changes', 'reward_channels',
+    'outcome', 'semantic_event', 'semantic_scene', 'state_visits', 'decision_latency_seconds',
+    'response_latency', 'elapsed', 'cpu_load', 'capture_rate_hz', 'decision_rate_hz',
+    'vision_long_edge', 'video_history_frames', 'video_interval_seconds', 'video_motion',
+    'crossgame_transfer_used', 'visual_concepts', 'visual_relations',
+    'planning_subgoals', 'from_x', 'from_y', 'to_x', 'to_y',
+    'keyboard_keys', 'keyboard_duration', 'joint_timing_variant',
+    'observed_compute_load', 'capture_compute_seconds_ema', 'decision_compute_seconds_ema',
+    'motion_ema', 'available_physical_memory_bytes', 'total_physical_memory_bytes',
+)
+WINDOWS_FILETIME_TICKS_PER_SECOND = 10_000_000
+DISPLAY_DEVICE_NAME_CHARS = 32
+DISPLAY_DEVICE_DESCRIPTION_CHARS = 128
 MIN_FREE_SPACE_BYTES = 128 * 1024 * 1024
 MIN_TARGET_DIMENSION = 64
 BOUNDS_INSET = 1
@@ -335,8 +364,6 @@ PREVIEW_ZOOM = 2
 VISION_LONG_EDGE = 384
 VISION_ADAPTIVE_MIN_EDGE = 112
 VISION_RESOLUTION_STEP = 48
-VISION_ADAPTIVE_MAX_EDGE = 1024
-VISION_MAX_CAPTURE_PIXELS = 768 * 768
 VISION_GRID_CACHE_ENTRIES = 12
 VISION_ADAPT_EVERY_STEPS = 8
 VISION_ACCELERATOR_FAILURE_LIMIT = 3
@@ -410,15 +437,17 @@ SATURATION_CHANGE_WEIGHT = 0.20
 GAME_ID_LENGTH = 16
 SHARED_HOST_EXECUTABLES = frozenset(("chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "brave.exe", "python.exe", "pythonw.exe", "java.exe", "javaw.exe", "hd-player.exe", "ldplayer.exe", "nox.exe", "dnplayer.exe", "mumuplayer.exe", "emulator.exe", "androidemulator.exe", "gameloop.exe", "aow_exe.exe", "qemu-system-x86_64.exe"))
 WINDOW_TITLE_LIMIT = 512
+GAME_TITLE_STABILITY_SIMILARITY = 0.86
+GAME_IDENTITY_CACHE_ENTRIES = STORE_HISTORY_CACHE_ENTRIES
 WINDOW_PATH_LIMIT = 32768
 WINDOW_CLASS_LIMIT = 256
 WINDOW_DISPLAY_NAME_LIMIT = 78
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SW_RESTORE = 9
 GA_ROOT = 2
+GA_ROOTOWNER = 3
 RECOVER_WINDOW_EVERY_SECONDS = 0.8
 SNAPSHOT_RECHECK_THRESHOLD = 0.0018
-ACTION_FEEDBACK_RECHECK_SECONDS = (0.20, 0.38)
 DRAG_DURATION_SECONDS = 0.38
 LONG_PRESS_SECONDS = 0.9
 RELATIVE_MOUSE_REACH = 0.35
@@ -469,6 +498,8 @@ SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 SRCCOPY = 0x00CC0020
+PW_CLIENTONLY = 0x00000001
+PW_RENDERFULLCONTENT = 0x00000002
 CAPTUREBLT = 0x40000000
 BI_RGB = 0
 DIB_RGB_COLORS = 0
@@ -539,13 +570,18 @@ KEYBOARD_EXTENDED_CODES = frozenset((VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_INSER
                                       VK_HOME, VK_END, VK_PRIOR, VK_NEXT))
 SCOPE_WINDOW = "窗口"
 SCOPE_FULLSCREEN = "全屏"
-SCOPE_OPTIONS = (SCOPE_WINDOW, SCOPE_FULLSCREEN)
+SCOPE_OPTIONS = (SCOPE_FULLSCREEN, SCOPE_WINDOW)
+AI_MODEL_OWN = "不使用别人的"
+AI_MODEL_EXTERNAL = "使用别人的"
+AI_MODEL_OPTIONS = (AI_MODEL_OWN, AI_MODEL_EXTERNAL)
+MODEL_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat"
+MODEL_VISION_NAME_MARKERS = ("vision", "llava", "minicpm-v", "qwen2-vl", "qwen2.5vl", "qwen3-vl", "gemma3", "moondream", "granite3.2-vision", "gpt-4o", "gpt-4.1", "gpt-5", "gpt-6", "claude-3", "claude-4", "gemini")
 STOP_KEY_CODES = {
     **{f"F{n}": VK_F1 + n - 1 for n in range(1, VK_F24 - VK_F1 + 2)},
     **{chr(n): n for n in range(ord("A"), ord("Z") + 1)},
     **{chr(n): n for n in range(ord("0"), ord("9") + 1)},
     **{f"数字键盘{n}": VK_NUMPAD0 + n for n in range(VK_NUMPAD9 - VK_NUMPAD0 + 1)},
-    "Esc": VK_ESCAPE, "空格": VK_SPACE, "回车": VK_RETURN, "Tab": VK_TAB,
+    "ESC": VK_ESCAPE, "空格": VK_SPACE, "回车": VK_RETURN, "Tab": VK_TAB,
     "退格": VK_BACK, "Shift": VK_SHIFT, "Ctrl": VK_CONTROL, "Alt": VK_MENU,
     "上方向键": VK_UP, "下方向键": VK_DOWN,
     "左方向键": VK_LEFT, "右方向键": VK_RIGHT,
@@ -594,7 +630,6 @@ KEYBOARD_HISTORY_PRIOR = 3.0
 KEYBOARD_CONTEXT_BACKOFF_WEIGHT = 0.36
 KEYBOARD_HISTORY_FIELDS = 7
 KEYBOARD_INITIAL_PRIOR_GAIN = 0.30
-KEYBOARD_CHORD_MAX_KEYS = VK_F24
 KEYBOARD_TRANSFER_GAIN = 0.65
 KEYBOARD_TRANSFER_PRIOR = KEYBOARD_HISTORY_PRIOR
 KEYBOARD_TRANSFER_EFFECT_WEIGHT = 0.36
@@ -602,10 +637,10 @@ KEYBOARD_TRANSFER_GOAL_WEIGHT = 0.90
 KEYBOARD_TRANSFER_OUTCOME_WEIGHT = 1.20
 KEYBOARD_TRANSFER_REWARD_WEIGHT = 0.12
 KEYBOARD_TRANSFER_MIN_EXAMPLES = 3
-KEYBOARD_NO_EFFECT_PENALTY = 0.36
-KEYBOARD_NO_EFFECT_MIN_EXAMPLES = 3
 KEYBOARD_COMPETENT_EFFECT = TEMPORAL_KEYBOARD_MIN_EFFECT
 KEYBOARD_COMPETENT_GAIN = 0.65
+KEYBOARD_NO_EFFECT_PENALTY = KEYBOARD_COMPETENT_GAIN
+KEYBOARD_NO_EFFECT_MIN_EXAMPLES = 3
 KEYBOARD_CONFIDENT_ACTION_RATE = 0.75
 KEYBOARD_COMBINATION_SEEDS = 6
 KEYBOARD_COMBINATION_MIN_SIGNAL = REPEAT_EFFECT_THRESHOLD * VISUAL_CHANGE_SCALE
@@ -614,9 +649,6 @@ KEYBOARD_MODIFIER_SEEDS = (VK_SHIFT, VK_CONTROL, VK_MENU)
 KEYBOARD_COMBINATION_MIN_SAMPLES = KEYBOARD_NO_EFFECT_MIN_EXAMPLES
 KEYBOARD_SEQUENCE_PRIORITY = 0.70
 KEYBOARD_SEQUENCE_PRIOR = KEYBOARD_HISTORY_PRIOR
-KEYBOARD_CONFLICTING_PAIRS = (
-    (ord("W"), ord("S")), (ord("A"), ord("D")),
-    (VK_UP, VK_DOWN), (VK_LEFT, VK_RIGHT))
 WORLD_MODEL_MAX_EDGES = 16000
 WORLD_MODEL_MAX_GOAL_EDGES = 24000
 WORLD_MODEL_DISCOUNT = 0.90
@@ -687,6 +719,7 @@ PM_REMOVE = 0x0001
 VK_FIRST = 0x08
 VK_CANCEL = 0x03
 VK_LAST = 0xFE
+KEYBOARD_CHORD_MAX_KEYS = len(range(1, VK_LAST + 1))
 KEYBOARD_KEYS = (VK_CANCEL, *range(VK_FIRST, VK_LAST + 1))
 KEY_DOWN_MASK = 0x8000
 LLKHF_INJECTED = 0x10
@@ -812,7 +845,6 @@ TERMINAL_PENDING_SCAN_INTERVAL_SECONDS = 0.20
 TERMINAL_CONFIRMATION_DELAY_SECONDS = 0.24
 TERMINAL_OBSERVATION_WINDOW_SECONDS = 6.0
 TERMINAL_REQUIRED_OBSERVATIONS = 2
-TERMINAL_TEXT_ONLY_OBSERVATIONS = TERMINAL_REQUIRED_OBSERVATIONS + 1
 TERMINAL_NEW_ROUND_GAP_SECONDS = TERMINAL_SCAN_INTERVAL_SECONDS * TERMINAL_REQUIRED_OBSERVATIONS
 OBJECTIVE_FONT_HEIGHTS = (11, 15, 20, 29)
 OBJECTIVE_GLYPHS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -840,6 +872,12 @@ OBJECTIVE_LABEL_VERTICAL_REACH = 0.075
 OBJECTIVE_LABEL_PROBE_SAMPLES = 14
 OBJECTIVE_LABEL_VERIFY_SAMPLES = 54
 OBJECTIVE_LABEL_MIN_CONTRAST = 34.0
+CAPTURE_DETAIL_MIN_RANGE = OBJECTIVE_LABEL_MIN_CONTRAST
+CAPTURE_DETAIL_SAMPLE_BUDGET = TEMPORAL_SAMPLE_BUDGET
+CAPTURE_FALLBACK_TIMEOUT_SECONDS = TEMPORAL_MIN_INTERVAL_SECONDS * TEMPORAL_AFTER_MAX_EVALUATIONS
+CAPTURE_FALLBACK_MAX_AGE_SECONDS = OBSERVER_FRAME_MAX_AGE_SECONDS
+CAPTURE_FALLBACK_RETRY_SECONDS = OBSERVER_HOOK_SILENCE_SECONDS
+CAPTURE_HISTORY_ENTRIES = STORE_HISTORY_CACHE_ENTRIES
 OBJECTIVE_LABEL_MATCH_THRESHOLD = 0.92
 OBJECTIVE_LABEL_SCAN_STEP = 2
 OBJECTIVE_LABEL_POSITIVE_CACHE_SECONDS = 15.0
@@ -1072,6 +1110,10 @@ EXPLORATION_OBJECT_SNAP_MIN_AREA = SEMANTIC_OBJECT_MIN_TILES
 STATE_REVALIDATION_MIN_AGE_SECONDS = TEMPORAL_MAX_INTERVAL_SECONDS
 STATE_REVALIDATION_DIFFERENCE = VISUAL_SCENE_TRANSITION_BONUS
 STATE_REVALIDATION_MAX_SKIPS = GOAL_STAGNATION_STEPS
+MODEL_VISUAL_MATCH_DISTANCE = DEMONSTRATION_GENERAL_SHAPE_DIFFERENCE / (FINGERPRINT_SIDE * FINGERPRINT_SIDE * (1 + 2))
+MODEL_VISUAL_SIGNATURE_FIELDS = len(('fingerprint', 'context', 'semantic'))
+CONTEXT_EDGE_LEVELS = CONTEXT_LEVELS
+COARSE_CONTEXT_EDGE_LEVELS = COARSE_CONTEXT_LEVELS
 KEYBOARD_DURATION_VARIANTS = (0.5, 1.0, 2.0, 4.0)
 KEYBOARD_DURATION_DEFAULT_VARIANT = KEYBOARD_DURATION_VARIANTS.index(1.0)
 KEYBOARD_DURATION_EXPLORATION = ACTION_PARAMETER_EXPLORATION
@@ -1095,8 +1137,8 @@ CONTROL_MODE_REWARD_WEIGHT = 1.25
 CONTROL_MODE_GOAL_WEIGHT = 2.1
 CONTROL_MODE_EFFECT_WEIGHT = 0.36
 CONTROL_MODE_OUTCOME_WEIGHT = 2.3
-CONTROL_MODE_NOOP_WEIGHT = 0.34
 CONTROL_MODE_HARM_WEIGHT = 1.2
+CONTROL_MODE_NOOP_WEIGHT = CONTROL_MODE_HARM_WEIGHT
 CONTROL_MODE_PLAN_BONUS = 0.30
 CONTROL_MODE_DEMO_BONUS = 0.38
 CONTROL_MODE_RANDOM_NOISE = 0.025
@@ -1179,22 +1221,21 @@ STORAGE_RETAIN_EPISODES = 30000
 STORAGE_RETAIN_DEMONSTRATIONS = 60000
 STORAGE_RETAIN_CONTROL_MODES = 12000
 STORAGE_RETAIN_GLOBAL_TABLES = 120000
-EVALUATION_EVENT_LIMIT = EVENT_RETENTION_COUNT
 EVALUATION_SCENARIO_MIN_OBSERVATIONS = TEMPORAL_MIN_FRAMES * 2
 EVALUATION_SCENARIO_MAX_RESULTS = DEMONSTRATION_MATCH_LIMIT
 EVALUATION_MATCHED_TRANSFER_MIN_OBSERVATIONS = TEMPORAL_MIN_FRAMES
-NEURAL_HIDDEN_LAYERS = (20, 12)
 NEURAL_OUTPUT_COUNT = 2
 NEURAL_INITIAL_WEIGHT_GAIN = 0.65
 NEURAL_LEARNING_RATE = 0.018
 NEURAL_LEARNING_DECAY = 0.00025
 NEURAL_WEIGHT_DECAY = 0.00001
 NEURAL_GRADIENT_CLIP = 1.0
-NEURAL_PERSIST_INTERVAL = 32
 NEURAL_MIN_GOAL_EXAMPLES = 30
 NEURAL_MIN_TOTAL_EXAMPLES = 96
 NEURAL_MAX_TARGET_ENTITIES = 8
-NEURAL_MAX_CANDIDATE_ACTIONS = 14
+NEURAL_MAX_CANDIDATE_ACTIONS = len(MOUSE_ACTIONS) + 1
+NEURAL_KEYBOARD_FEATURES = VISUAL_CONCEPT_GRID_SIDE ** 2 * 2
+NEURAL_CONTROL_FEATURES = len(CONTROL_MODES)
 NEURAL_MAX_DESTINATION_CANDIDATES = 3
 NEURAL_MIN_DESTINATION_DISTANCE = 0.038
 NEURAL_GOAL_GAIN = 2.4
@@ -1202,8 +1243,8 @@ NEURAL_EFFECT_GAIN = 0.28
 NEURAL_UNCERTAINTY_GAIN = 0.04
 NEURAL_MIN_ACTION_SCORE = 0.075
 NEURAL_REPLAY_CHANCE = 0.62
-NEURAL_INTRINSIC_TRAIN_SHARE = 0.22
 NEURAL_GLOBAL_BLEND = 0.45
+NEURAL_CONTROL_PREDICTION_GAIN = CONTROL_MODE_GOAL_WEIGHT * NEURAL_GLOBAL_BLEND
 NEURAL_MIN_CROSSGAME_EXAMPLES = 60
 NEURAL_MAX_GOAL_TARGET = 1.0
 NEURAL_MAX_EFFECT_TARGET = 1.0
@@ -1304,7 +1345,7 @@ FALLBACK_CONTEXT_LIMIT = 256
 ACCELERATOR_METADATA_URL = "https://pypi.org/pypi/numpy/json"
 ACCELERATOR_ARCHIVE_HOST = "files.pythonhosted.org"
 ACCELERATOR_NAME = "numpy"
-ACCELERATOR_METADATA_MAX_BYTES = 16 * 1024 * 1024
+ACCELERATOR_METADATA_MAX_BYTES = BLACKBOX_PROBE_MAX_BYTES
 ACCELERATOR_ARCHIVE_MAX_BYTES = 80 * 1024 * 1024
 ACCELERATOR_UNPACK_MAX_BYTES = 512 * 1024 * 1024
 ACCELERATOR_ARCHIVE_MAX_ENTRIES = 10000
@@ -1313,11 +1354,16 @@ ACCELERATOR_ARCHIVE_ENCRYPTED_FLAG = 0x0001
 ARCHIVE_UNIX_MODE_SHIFT = 16
 ACCELERATOR_TIMEOUT_SECONDS = 8.0
 ACCELERATOR_RETRIES = 2
+BLACKBOX_PROBE_TIMEOUT_SECONDS = ACCELERATOR_TIMEOUT_SECONDS * ACCELERATOR_RETRIES
 ACCELERATOR_RETRY_SECONDS = 0.8
-ACCELERATOR_CHUNK_BYTES = 128 * 1024
+ACCELERATOR_CHUNK_BYTES = BLACKBOX_STREAM_CHUNK_BYTES
 ACCELERATOR_PROGRESS_BYTES = 1024 * 1024
 ACCELERATOR_DISK_MULTIPLIER = 3
 ACCELERATOR_METADATA_MARKER = "ready.json"
+MODEL_HTTP_TIMEOUT_SECONDS = ACCELERATOR_TIMEOUT_SECONDS
+MODEL_RETRY_SECONDS = ERROR_REPORT_SECONDS
+MODEL_FAILURE_REDISCOVERY_COUNT = VISION_ACCELERATOR_FAILURE_LIMIT
+MODEL_HTTP_MAX_BYTES = ACCELERATOR_CHUNK_BYTES
 NUMPY_ACCELERATOR = None
 NUMPY_IMPORT_LOCK = threading.RLock()
 
@@ -1582,15 +1628,115 @@ class AgentSessionConfig(NamedTuple):
     stop_name: str
     stop_code: int
     window: object
-    area: tuple
+    area: tuple | None
     game_id: str | None
+    ai_model: str = AI_MODEL_OWN
+
+
+class DeferredWrites:
+    def __init__(self, store):
+        self.store = store
+        self.queue = queue.Queue()
+        self.lock = threading.RLock()
+        self.condition = threading.Condition(self.lock)
+        self.closed = False
+        self.failed = 0
+        self.last_error = ''
+        self.submitted = self.completed = 0
+        self.heartbeat = time.monotonic()
+        self.operation = None
+        self.operation_started = None
+        self.mean_seconds = 0.0
+        self.thread = threading.Thread(target=self.run, daemon=True, name='learning-storage')
+        self.thread.start()
+
+    def submit(self, name, args, kwargs):
+        payload = copy.deepcopy((name, args, kwargs))
+        with self.condition:
+            if self.closed:
+                raise RuntimeError('学习写入服务已关闭')
+            if not self.thread.is_alive():
+                self.thread = threading.Thread(target=self.run, daemon=True, name='learning-storage-recovery')
+                self.thread.start()
+            self.submitted += 1
+            self.queue.put(payload)
+
+    def run(self):
+        while True:
+            try:
+                item = self.queue.get(timeout=ERROR_RETRY_SECONDS)
+            except queue.Empty:
+                with self.condition:
+                    self.heartbeat = time.monotonic()
+                continue
+            if item is None:
+                self.queue.task_done()
+                return
+            name, args, kwargs = item
+            with self.condition:
+                self.operation = name
+                self.operation_started = time.monotonic()
+                self.heartbeat = self.operation_started
+            try:
+                getattr(self.store, name)(*args, **kwargs)
+            except Exception:
+                self.failed += 1
+                self.last_error = traceback.format_exc()
+                self.store.last_error = self.last_error
+                self.store.event('deferred_write_error', {'operation': name, 'error': self.last_error})
+            finally:
+                self.queue.task_done()
+                with self.condition:
+                    seconds = time.monotonic() - self.operation_started
+                    self.completed += 1
+                    self.mean_seconds += (seconds - self.mean_seconds) / self.completed
+                    self.heartbeat = time.monotonic()
+                    self.operation = self.operation_started = None
+                    self.condition.notify_all()
+
+    def flush(self, timeout=None):
+        with self.condition:
+            target = self.submitted
+            pending = max(0, target - self.completed)
+            timeout = max(DATABASE_BUSY_SECONDS, self.mean_seconds * (pending + 1)) if timeout is None else timeout
+            deadline = time.monotonic() + timeout
+            while self.completed < target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self.thread.is_alive():
+                    raise TimeoutError('后台写入尚未完成，操作=' + str(self.operation))
+                self.condition.wait(min(ERROR_RETRY_SECONDS, remaining))
+
+    def close(self):
+        with self.condition:
+            if self.closed:
+                return
+            self.closed = True
+        self.flush()
+        self.queue.put(None)
+        self.thread.join(timeout=DATABASE_BUSY_SECONDS)
+        if self.thread.is_alive():
+            raise TimeoutError('后台写入线程尚未关闭')
+
+    def telemetry(self):
+        with self.condition:
+            return {'pending': max(0, self.submitted-self.completed), 'worker_alive': self.thread.is_alive(),
+                    'failed': self.failed, 'last_error': self.last_error, 'submitted': self.submitted,
+                    'completed': self.completed, 'heartbeat_age_seconds': time.monotonic()-self.heartbeat,
+                    'operation': self.operation, 'operation_seconds': (time.monotonic()-self.operation_started
+                        if self.operation_started is not None else None), 'mean_write_seconds': self.mean_seconds}
+
+
+class TargetChanged(OSError):
+    def __init__(self, details):
+        self.details = details
+        super().__init__('目标状态变化：' + details['reason'])
 
 
 class Store:
     def __init__(self, directory):
         self.folder = Path(directory)
         self.folder.mkdir(parents=True, exist_ok=True)
-        self.path = self.folder / "experience.sqlite3"
+        self.path = self.folder / ("experience-" + STATE_ENCODING_VERSION + ".sqlite3")
         self.lock = threading.RLock()
         self.db = sqlite3.connect(self.path, timeout=DATABASE_BUSY_SECONDS, check_same_thread=False)
         self.last_error = ""
@@ -1613,7 +1759,14 @@ class Store:
         self.keyboard_transfer_cache = collections.OrderedDict()
         self.keyboard_transfer_version = 0
         self.last_maintenance = time.monotonic()
+        self.maintenance_lock = threading.Lock()
+        self.maintenance_worker = None
         self.last_reward_channels = {}
+        self.neural_service = None
+        self.neural_service_lock = threading.RLock()
+        self.write_service = None
+        self.write_service_lock = threading.RLock()
+        self.calibration_cache = {}
         try:
             with self.db:
                 self.db.execute("PRAGMA journal_mode=WAL")
@@ -1736,37 +1889,261 @@ class Store:
                 self.db.execute("CREATE TABLE IF NOT EXISTS neural_models(name TEXT PRIMARY KEY,state TEXT NOT NULL,updates INTEGER NOT NULL,goal_samples INTEGER NOT NULL,updated TEXT NOT NULL)")
                 self.db.execute("CREATE TABLE IF NOT EXISTS neural_experiences(game TEXT NOT NULL,inputs TEXT NOT NULL,action TEXT NOT NULL,goal TEXT NOT NULL,n INTEGER NOT NULL,reward REAL NOT NULL,effect REAL NOT NULL,verified INTEGER NOT NULL,updated TEXT NOT NULL,PRIMARY KEY(game,inputs,action,goal))")
                 self.db.execute("CREATE INDEX IF NOT EXISTS neural_experiences_by_game ON neural_experiences(game,verified DESC,n DESC)")
+                self.db.execute("CREATE TABLE IF NOT EXISTS neural_observations(game TEXT NOT NULL,inputs TEXT NOT NULL,action TEXT NOT NULL,goal TEXT NOT NULL,verified INTEGER NOT NULL,n INTEGER NOT NULL,reward REAL NOT NULL,effect REAL NOT NULL,updated TEXT NOT NULL,PRIMARY KEY(game,inputs,action,goal,verified))")
+                self.db.execute("CREATE INDEX IF NOT EXISTS neural_observations_by_game ON neural_observations(game,verified DESC,n DESC)")
+                self.db.execute("CREATE TABLE IF NOT EXISTS runtime_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+                self.db.execute("INSERT OR REPLACE INTO runtime_metadata VALUES('state_encoding_version',?)", (STATE_ENCODING_VERSION,))
+                seed = self.db.execute("SELECT value FROM runtime_metadata WHERE key='random_seed'").fetchone()
+                self.random_seed = seed[0] if seed else uuid.uuid4().hex
+                self.db.execute("INSERT OR IGNORE INTO runtime_metadata VALUES('random_seed',?)", (self.random_seed,))
+                self.random_lock = threading.RLock()
+                self.random_counters = collections.Counter()
+                self.random_streams = {}
+                self.db.execute("CREATE TABLE IF NOT EXISTS parameter_evidence(game TEXT NOT NULL,context TEXT NOT NULL,name TEXT NOT NULL,source TEXT NOT NULL,n INTEGER NOT NULL,last_sample REAL NOT NULL,updated TEXT NOT NULL,PRIMARY KEY(game,context,name,source))")
+                if self.db.execute("SELECT 1 FROM runtime_metadata WHERE key='neural_label_migration'").fetchone() is None:
+                    self.db.execute("INSERT INTO neural_observations SELECT game,inputs,action,goal,CASE WHEN verified=n THEN 1 ELSE 0 END,n,CASE WHEN verified=n THEN reward ELSE 0 END,effect,updated FROM neural_experiences")
+                    self.db.execute("INSERT INTO runtime_metadata(key,value) VALUES('neural_label_migration',?)", (utc_stamp(),))
+                self.db.execute("CREATE TABLE IF NOT EXISTS demonstration_replays(game TEXT NOT NULL,coarse TEXT NOT NULL,demonstration_id INTEGER NOT NULL,control TEXT NOT NULL,n INTEGER NOT NULL,reward REAL NOT NULL,effect REAL NOT NULL,successes INTEGER NOT NULL,noops INTEGER NOT NULL,updated TEXT NOT NULL,PRIMARY KEY(game,coarse,demonstration_id,control))")
+                self.db.execute("CREATE TABLE IF NOT EXISTS adaptive_parameters(game TEXT NOT NULL,context TEXT NOT NULL,name TEXT NOT NULL,n INTEGER NOT NULL,mean REAL NOT NULL,m2 REAL NOT NULL,PRIMARY KEY(game,context,name))")
+                self.db.execute("CREATE TABLE IF NOT EXISTS neural_baselines(name TEXT PRIMARY KEY,state TEXT NOT NULL,created TEXT NOT NULL)")
+                self.db.execute("CREATE TABLE IF NOT EXISTS evaluation_holdout(game TEXT NOT NULL,sample_key TEXT NOT NULL,inputs TEXT NOT NULL,n INTEGER NOT NULL,reward REAL NOT NULL,effect REAL NOT NULL,verified INTEGER NOT NULL,updated TEXT NOT NULL,PRIMARY KEY(game,sample_key,verified))")
+                self.db.execute("CREATE TABLE IF NOT EXISTS agent_sessions(session_id TEXT PRIMARY KEY,started TEXT NOT NULL,ended TEXT,elapsed REAL NOT NULL,status TEXT NOT NULL)")
                 self.db.execute("CREATE INDEX IF NOT EXISTS world_goal_category ON world_goal_transitions(game,category,source)")
         except Exception:
             self.db.close()
             raise
 
-    def record_neural_experience(self, game, inputs, action, goal, reward, effect, verified):
-        if (not self.can_record() or not game or action not in MOUSE_ACTIONS or
-                not isinstance(inputs, (tuple, list)) or
-                len(inputs) != OnlineCausalNetwork.INPUT_SIZE or
-                not all(isinstance(value, (int, float)) and math.isfinite(value) for value in inputs) or
-                not all(math.isfinite(value) for value in (reward, effect))):
+    def random_stream(self, name):
+        with self.random_lock:
+            index = self.random_counters[name]
+            self.random_counters[name] += 1
+            key = name + '/' + str(index)
+            seed = hashlib.sha256((self.random_seed + '/' + key).encode('utf-8')).hexdigest()
+            generator = random.Random(seed)
+            self.random_streams[key] = (seed, generator)
+            return generator
+
+    def random_snapshot(self):
+        with self.random_lock:
+            return {'master_seed': self.random_seed,
+                    'streams': {name: {'seed': seed, 'state': generator.getstate()}
+                                for name, (seed, generator) in self.random_streams.items()}}
+
+    def defer_write(self, name, *args, **kwargs):
+        with self.write_service_lock:
+            if self.write_service is None:
+                self.write_service = DeferredWrites(self)
+            self.write_service.submit(name, args, kwargs)
+
+    def calibration(self, game, context, name, initial):
+        key = (game, context or '*', name)
+        with self.lock:
+            if key not in self.calibration_cache:
+                row = self.db.execute(
+                    "SELECT n,mean,m2 FROM adaptive_parameters WHERE game=? AND context=? AND name=?",
+                    key).fetchone()
+                self.calibration_cache[key] = tuple(row) if row else (0, float(initial), 0.0)
+            n, mean, m2 = self.calibration_cache[key]
+        uncertainty = math.sqrt(max(0.0, m2) / (n - 1) / n) if n > 1 else None
+        return {'value': (mean * n + initial) / (n + 1), 'samples': n,
+                'uncertainty': uncertainty, 'confidence': n / (n + 1)}
+
+    def calibrate(self, game, context, name, sample, initial, source='observed_feedback'):
+        if not math.isfinite(sample):
             return
-        encoded = json.dumps(inputs, separators=(',', ':'), allow_nan=False)
+        key = (game, context or '*', name)
+        with self.lock:
+            self.calibration(game, context, name, initial)
+            n, mean, m2 = self.calibration_cache[key]
+            n += 1
+            delta = sample - mean
+            mean += delta / n
+            m2 += delta * (sample - mean)
+            self.calibration_cache[key] = n, mean, m2
+            self.defer_write('persist_calibration', key, (n, mean, m2), source, sample)
+
+    def persist_calibration(self, key, values, source='observed_feedback', sample=None):
+        if not self.can_record():
+            return
         with self.lock, self.db:
             self.db.execute(
-                "INSERT INTO neural_experiences(game,inputs,action,goal,n,reward,effect,verified,updated) "
-                "VALUES(?,?,?,?,1,?,?,?,?) ON CONFLICT(game,inputs,action,goal) "
-                "DO UPDATE SET n=n+1,reward=reward+excluded.reward,effect=effect+excluded.effect,"
-                "verified=verified+excluded.verified,updated=excluded.updated",
-                (game, encoded, action, goal, reward, effect, int(verified), utc_stamp()))
+                "INSERT INTO adaptive_parameters VALUES(?,?,?,?,?,?) ON CONFLICT(game,context,name) "
+                "DO UPDATE SET n=excluded.n,mean=excluded.mean,m2=excluded.m2 WHERE excluded.n>adaptive_parameters.n",
+                (*key, *values))
+            if sample is not None:
+                self.db.execute("INSERT INTO parameter_evidence VALUES(?,?,?,?,1,?,?) "
+                    "ON CONFLICT(game,context,name,source) DO UPDATE SET n=n+1,last_sample=excluded.last_sample,updated=excluded.updated",
+                    (*key, source, sample, utc_stamp()))
+
+    def session_started(self, session_id, timestamp):
+        try:
+            with self.lock, self.db:
+                self.db.execute("INSERT OR IGNORE INTO agent_sessions VALUES(?,?,NULL,0,'running')",
+                                (session_id, timestamp))
+        except sqlite3.Error as error:
+            self.last_error = str(error)
+
+    def session_progress(self, session_id, elapsed, stopped=False):
+        try:
+            with self.lock, self.db:
+                self.db.execute("UPDATE agent_sessions SET elapsed=MAX(elapsed,?),ended=?,status=? "
+                                "WHERE session_id=? AND (status<>'stopped' OR ?)",
+                                (max(0.0, elapsed), utc_stamp() if stopped else None,
+                                 'stopped' if stopped else 'running', session_id, int(stopped)))
+        except sqlite3.Error as error:
+            self.last_error = str(error)
+
+    def record_demonstration_replay(self, game, coarse, identifier, control, reward, effect, goal):
+        if not control or not self.can_record():
+            return
+        success = int((goal is not None and goal > 0.0) or
+                      goal is None and effect >= VISUAL_EFFECT_THRESHOLD)
+        noop = int(effect < VISUAL_EFFECT_THRESHOLD and (goal is None or goal <= 0.0))
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO demonstration_replays VALUES(?,?,?,?,1,?,?,?,?,?) "
+                "ON CONFLICT(game,coarse,demonstration_id,control) DO UPDATE SET "
+                "n=n+1,reward=reward+excluded.reward,effect=effect+excluded.effect,"
+                "successes=successes+excluded.successes,noops=noops+excluded.noops,updated=excluded.updated",
+                (game, coarse, identifier, control, reward, effect, success, noop, utc_stamp()))
+            self.db.execute("UPDATE demonstrations SET replay_n=replay_n+1,replay_effect=replay_effect+? WHERE id=?",
+                            (reward, identifier))
+            self.demonstration_cache.pop(game, None)
+            self.demonstration_version += 1
+
+    def demonstration_replay_history(self, game, coarse):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT demonstration_id,control,SUM(n),SUM(reward),SUM(successes),SUM(noops) "
+                "FROM demonstration_replays WHERE game=? AND coarse=? GROUP BY demonstration_id,control",
+                (game, coarse)).fetchall()
+        return {(identifier, control): (n, reward, successes, noops)
+                for identifier, control, n, reward, successes, noops in rows}
+
+    def neural_predictor(self, game):
+        with self.neural_service_lock:
+            if self.neural_service is None:
+                self.neural_service = NeuralTrainingService(self)
+            return self.neural_service.get(game)
+
+    def flush_learning(self):
+        if self.write_service is not None:
+            self.write_service.flush()
+        if self.neural_service is not None:
+            self.neural_service.flush()
+
+    def record_neural_experiences(self, records):
+        if not records or not self.can_record():
+            return
+        encoded = []
+        for game, inputs, action, goal, reward, effect, verified in records:
+            if (not game or action not in (*MOUSE_ACTIONS, KEYBOARD_ACTION_NAME) or
+                    len(inputs) != OnlineCausalNetwork.INPUT_SIZE or
+                    not all(math.isfinite(float(value)) for value in inputs) or
+                    not all(math.isfinite(value) for value in (reward, effect))):
+                continue
+            encoded.append((game, json.dumps(inputs, separators=(',', ':'), allow_nan=False),
+                            action, goal, int(verified), reward if verified else 0.0,
+                            effect, utc_stamp()))
+        with self.lock, self.db:
+            self.db.executemany(
+                "INSERT INTO neural_observations(game,inputs,action,goal,verified,n,reward,effect,updated) "
+                "VALUES(?,?,?,?,?,1,?,?,?) ON CONFLICT(game,inputs,action,goal,verified) "
+                "DO UPDATE SET n=n+1,reward=reward+excluded.reward,effect=effect+excluded.effect,updated=excluded.updated",
+                encoded)
+
+    def record_holdout(self, game, key, encoded, sample):
+        if not self.can_record():
+            return
+        _, reward, effect, verified = sample
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO evaluation_holdout VALUES(?,?,?,1,?,?,?,?) "
+                "ON CONFLICT(game,sample_key,verified) DO UPDATE SET n=n+1,reward=reward+excluded.reward,effect=effect+excluded.effect,updated=excluded.updated",
+                (game, key, encoded, reward if verified else 0.0, effect, int(verified), utc_stamp()))
+
+    def holdout_evaluation(self):
+        with self.lock:
+            rows = self.db.execute("SELECT game,sample_key,inputs,n,reward/n,effect/n,verified FROM evaluation_holdout ORDER BY game,sample_key,verified").fetchall()
+            baselines = dict(self.db.execute("SELECT name,state FROM neural_baselines"))
+            trained = dict(self.db.execute("SELECT name,state FROM neural_models"))
+        grouped = collections.defaultdict(list)
+        for row in rows:
+            grouped[row[0]].append(row)
+        results = []
+        for game, items in sorted(grouped.items()):
+            if game not in baselines or game not in trained:
+                results.append({'game': game, 'status': 'awaiting_trained_checkpoint', 'samples': len(items)})
+                continue
+            networks = []
+            for encoded in (baselines[game], trained[game]):
+                data = json.loads(encoded)
+                network = OnlineCausalNetwork(None, game)
+                if not network.valid(data['weights'], data['biases']):
+                    raise ValueError('评估模型结构无效')
+                network.weights, network.biases = data['weights'], data['biases']
+                networks.append(network)
+            cases = []
+            for _, key, raw, count, reward, effect, verified in items:
+                features = json.loads(raw)
+                predictions = [network.predict(features) for network in networks]
+                cases.append({'sample_key': key, 'observations': count, 'verified': bool(verified),
+                    'target_goal': reward if verified else None, 'target_effect': effect,
+                    'baseline': predictions[0], 'learned': predictions[1]})
+            def metrics(name):
+                observed = sum(case['observations'] for case in cases)
+                verified = sum(case['observations'] for case in cases if case['verified'])
+                return {'effect_mae': sum(abs(case[name][1]-case['target_effect'])*case['observations']
+                    for case in cases) / observed if observed else None,
+                    'verified_goal_mae': sum(abs(case[name][0]-case['target_goal'])*case['observations']
+                    for case in cases if case['verified']) / verified if verified else None,
+                    'verified_observations': verified, 'observations': observed}
+            baseline, learned = metrics('baseline'), metrics('learned')
+            results.append({'game': game, 'status': 'evaluated', 'samples': len(cases),
+                'baseline': baseline, 'learned': learned,
+                'learned_minus_baseline': {key: learned[key]-baseline[key]
+                    if learned[key] is not None and baseline[key] is not None else None
+                    for key in ('effect_mae', 'verified_goal_mae')},
+                'baseline_sha256': hashlib.sha256(baselines[game].encode('utf-8')).hexdigest(),
+                'learned_sha256': hashlib.sha256(trained[game].encode('utf-8')).hexdigest(),
+                'cases': cases})
+        return {'basis': 'deterministic_prospective_holdout', 'state_encoding_version': STATE_ENCODING_VERSION,
+                'partition': 'sha256(inputs) < 1/sqrt(input_dimensions); identical inputs excluded from every training scope',
+                'dataset_sha256': hashlib.sha256(json.dumps(rows, separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest(),
+                'results': results, 'limitations': '固定留出输入上的预测误差对照；没有执行反事实游戏操作，不代表任务完成率或胜率。'}
+
+    def checkpoint_metadata(self):
+        with self.lock:
+            models = [dict(name=name, state=json.loads(state), updates=updates, goal_samples=goals)
+                      for name, state, updates, goals in self.db.execute("SELECT name,state,updates,goal_samples FROM neural_models ORDER BY name")]
+            baselines = {name: json.loads(state) for name, state in self.db.execute("SELECT name,state FROM neural_baselines ORDER BY name")}
+            parameters = [dict(game=game, context=context, name=name, samples=n, mean=mean, m2=m2)
+                          for game, context, name, n, mean, m2 in self.db.execute("SELECT * FROM adaptive_parameters ORDER BY game,context,name")]
+            evidence = [dict(game=game, context=context, name=name, source=source, samples=n, last_sample=sample, updated=updated)
+                        for game, context, name, source, n, sample, updated in self.db.execute("SELECT * FROM parameter_evidence ORDER BY game,context,name,source")]
+        constants = {}
+        for name, value in globals().copy().items():
+            if not name.isupper() or not isinstance(value, (int, float, str, tuple, list, dict, set, frozenset)):
+                continue
+            try:
+                normalized = json.loads(json.dumps(value, default=lambda item: sorted(item) if isinstance(item, (set, frozenset)) else str(item)))
+            except (ValueError, TypeError):
+                continue
+            contract = name.startswith(('VK_', 'WM_', 'WH_', 'GA_', 'GW_', 'SM_', 'KEYEVENTF_', 'MOUSEEVENTF_', 'INPUT_', 'LLKHF_', 'LLMHF_'))
+            constants[name] = {'value': normalized, 'source': 'platform_contract' if contract else 'initial_configuration_or_prior'}
+        return {'state_encoding_version': STATE_ENCODING_VERSION, 'database_file': self.path.name,
+                'random': self.random_snapshot(), 'models': models, 'baselines': baselines,
+                'parameters': parameters, 'parameter_evidence': evidence, 'configuration': constants}
 
     def neural_examples(self, game):
         with self.lock:
             local = self.db.execute(
                 "SELECT inputs,action,goal,reward/n,effect/n,verified "
-                "FROM neural_experiences WHERE game=? ORDER BY verified DESC,n DESC LIMIT ?",
+                "FROM neural_observations WHERE game=? ORDER BY verified DESC,n DESC LIMIT ?",
                 (game, NEURAL_REPLAY_INITIAL_SAMPLES)).fetchall()
             transfer = self.db.execute(
-                "SELECT inputs,action,goal,SUM(reward)/SUM(n),SUM(effect)/SUM(n),SUM(verified) "
-                "FROM neural_experiences WHERE game<>? AND verified>0 GROUP BY inputs,action,goal "
-                "ORDER BY SUM(verified) DESC,SUM(n) DESC LIMIT ?",
+                "SELECT inputs,action,goal,SUM(reward)/SUM(n),SUM(effect)/SUM(n),verified "
+                "FROM neural_observations WHERE game<>? AND verified=1 GROUP BY inputs,action,goal,verified "
+                "ORDER BY SUM(n) DESC LIMIT ?",
                 (game, NEURAL_REPLAY_OTHER_GAME_SAMPLES)).fetchall()
         return local + transfer
 
@@ -2043,11 +2420,31 @@ class Store:
                 "DELETE FROM reasoning_programs WHERE game=? AND id=?",
                 ((game, identifier) for identifier in pruned))
 
-    def maintain(self):
+    def maintain(self, force=False):
         now = time.monotonic()
-        if now - self.last_maintenance < STORAGE_MAINTENANCE_SECONDS:
+        if ((now - self.last_maintenance < (
+                    STORAGE_CHECK_SECONDS if force else STORAGE_MAINTENANCE_SECONDS))
+                or not self.maintenance_lock.acquire(blocking=False)):
             return
         self.last_maintenance = now
+        try:
+            worker = threading.Thread(target=self._maintain_worker,
+                                      name="agent-storage-maintenance", daemon=True)
+            self.maintenance_worker = worker
+            worker.start()
+        except Exception:
+            self.maintenance_lock.release()
+            raise
+
+    def _maintain_worker(self):
+        try:
+            self._prune_records()
+        except Exception as error:
+            self.last_error = str(error)
+        finally:
+            self.maintenance_lock.release()
+
+    def _prune_records(self):
         limits = (
             ("world_transitions", WORLD_MODEL_MAX_EDGES,
              "ABS(goal)+ABS(episode_credit)+wins+losses ASC,n ASC"),
@@ -2062,6 +2459,8 @@ class Store:
             ("verified_sequences", STORAGE_RETAIN_SEQUENCES,
              "positive-negative ASC,n ASC"),
             ("neural_experiences", NEURAL_REPLAY_PERSIST_LIMIT,
+             "verified ASC,n ASC"),
+            ("neural_observations", NEURAL_REPLAY_PERSIST_LIMIT,
              "verified ASC,n ASC"),
             ("behavioral_transitions", STORAGE_RETAIN_TRANSITIONS,
              "human_n+agent_n ASC,ABS(agent_reward)+human_effect ASC"),
@@ -2085,6 +2484,34 @@ class Store:
              "n ASC,effect ASC"),
             ("keyboard_sequences", STORAGE_RETAIN_TRANSITIONS,
              "wins+losses ASC,ABS(goal) ASC,n ASC"),
+            ("demonstrations", STORAGE_RETAIN_DEMONSTRATIONS,
+             "n ASC,ABS(effect)+ABS(replay_effect) ASC"),
+            ("keyboard_agent_actions", STORAGE_RETAIN_TRANSITIONS,
+             "n ASC,ABS(total_reward) ASC"),
+            ("keyboard_duration_values", STORAGE_RETAIN_TRANSITIONS,
+             "n ASC,ABS(total) ASC"),
+            ("keyboard_goal_credit", STORAGE_RETAIN_EPISODES,
+             "n ASC,ABS(total) ASC"),
+            ("keyboard_episode_credit", STORAGE_RETAIN_EPISODES,
+             "n ASC,ABS(total) ASC"),
+            ("goal_metric_values", STORAGE_RETAIN_GLOBAL_TABLES,
+             "n ASC,ABS(gained)+ABS(spent) ASC"),
+            ("goal_metric_preferences", STORAGE_RETAIN_GLOBAL_TABLES,
+             "n ASC,ABS(total) ASC"),
+            ("visual_affordances", STORAGE_RETAIN_GLOBAL_TABLES,
+             "n+human_n ASC,ABS(total)+ABS(human_effect) ASC"),
+            ("episode_affordances", STORAGE_RETAIN_EPISODES,
+             "human_n ASC,ABS(total) ASC,n ASC"),
+            ("control_modes", STORAGE_RETAIN_CONTROL_MODES,
+             "wins+losses+goal_n ASC,ABS(goal) ASC,n ASC"),
+            ("reasoning_modes", STORAGE_RETAIN_CONTROL_MODES,
+             "wins+losses+goal_n ASC,ABS(goal) ASC,n ASC"),
+            ("joint_timing", STORAGE_RETAIN_CONTROL_MODES,
+             "wins+losses+goal_n ASC,ABS(goal) ASC,n ASC"),
+            ("semantic_hypotheses", STORAGE_RETAIN_GLOBAL_TABLES,
+             "n ASC,ABS(support) ASC"),
+            ("input_timing", STORAGE_RETAIN_GLOBAL_TABLES,
+             "human_n+agent_n ASC"),
         )
         unscoped = (
             ("visits", STORAGE_RETAIN_GLOBAL_TABLES, "n ASC"),
@@ -2095,29 +2522,61 @@ class Store:
             ("scene_transitions", STORAGE_RETAIN_GLOBAL_TABLES, "n ASC,ABS(total) ASC"),
             ("learned_aims", STORAGE_RETAIN_GLOBAL_TABLES, "n ASC,strength ASC"),
         )
-        with self.lock:
-            try:
-                with self.db:
-                    for table, capacity, rank in limits:
-                        games = self.db.execute(
-                            "SELECT game,COUNT(*) FROM " + table + " GROUP BY game").fetchall()
-                        for game, count in games:
-                            if count <= capacity:
-                                continue
+        try:
+            free_space = shutil.disk_usage(self.folder).free
+            retention_scale = max(VISION_PRESSURE_SAMPLING_RATIO, min(
+                1.0, free_space / (MIN_FREE_SPACE_BYTES * ACCELERATOR_DISK_MULTIPLIER)))
+        except OSError:
+            retention_scale = 1.0
+        try:
+            for table, capacity, rank in limits:
+                capacity = max(1, round(capacity * retention_scale))
+                with self.lock:
+                    games = self.db.execute(
+                        "SELECT game,COUNT(*) FROM " + table + " GROUP BY game").fetchall()
+                for game, count in games:
+                    while count > capacity:
+                        batch = min(count - capacity, EVENT_PRUNE_INTERVAL)
+                        with self.lock, self.db:
                             self.db.execute(
                                 "DELETE FROM " + table + " WHERE rowid IN (SELECT rowid FROM "
                                 + table + " WHERE game=? ORDER BY " + rank + " LIMIT ?)",
-                                (game, count - capacity))
-                    for (game,) in self.db.execute(
-                            "SELECT game FROM reasoning_programs GROUP BY game").fetchall():
-                        self.prune_reasoning_programs(game, STORAGE_RETAIN_SEQUENCES)
-                    self.maintain_concepts()
-                    for table, capacity, rank in unscoped:
-                        count = self.db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
-                        if count > capacity:
-                            self.db.execute(
-                                "DELETE FROM " + table + " WHERE rowid IN (SELECT rowid FROM "
-                                + table + " ORDER BY " + rank + " LIMIT ?)", (count - capacity,))
+                                (game, batch))
+                        count -= batch
+                        time.sleep(0)
+            with self.lock, self.db:
+                self.db.execute(
+                    "DELETE FROM demonstration_sequences WHERE NOT EXISTS "
+                    "(SELECT 1 FROM demonstrations WHERE id=previous_id) OR NOT EXISTS "
+                    "(SELECT 1 FROM demonstrations WHERE id=next_id)")
+                self.db.execute(
+                    "DELETE FROM demonstration_joint_keys WHERE NOT EXISTS "
+                    "(SELECT 1 FROM demonstrations WHERE id=demonstration_id)")
+                self.db.execute(
+                    "DELETE FROM demonstration_video WHERE NOT EXISTS "
+                    "(SELECT 1 FROM demonstrations WHERE id=demonstration_id)")
+            with self.lock:
+                program_games = self.db.execute(
+                    "SELECT game FROM reasoning_programs GROUP BY game").fetchall()
+            for (game,) in program_games:
+                with self.lock, self.db:
+                    self.prune_reasoning_programs(
+                        game, max(1, round(STORAGE_RETAIN_SEQUENCES * retention_scale)))
+            with self.lock, self.db:
+                self.maintain_concepts()
+            for table, capacity, rank in unscoped:
+                capacity = max(1, round(capacity * retention_scale))
+                with self.lock:
+                    count = self.db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+                while count > capacity:
+                    batch = min(count - capacity, EVENT_PRUNE_INTERVAL)
+                    with self.lock, self.db:
+                        self.db.execute(
+                            "DELETE FROM " + table + " WHERE rowid IN (SELECT rowid FROM "
+                            + table + " ORDER BY " + rank + " LIMIT ?)", (batch,))
+                    count -= batch
+                    time.sleep(0)
+            with self.lock:
                 self.db.execute("PRAGMA optimize")
                 self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 self.history_version += 1
@@ -2126,6 +2585,7 @@ class Store:
                 self.semantic_version += 1
                 self.keyboard_transfer_version += 1
                 self.objective_credit_version += 1
+                self.demonstration_version += 1
                 self.history_cache.clear()
                 self.model_cache.clear()
                 self.world_cache.clear()
@@ -2134,15 +2594,18 @@ class Store:
                 self.objective_cache.clear()
                 self.interaction_cache.clear()
                 self.keyboard_transfer_cache.clear()
-            except sqlite3.Error as error:
-                self.last_error = str(error)
+        except sqlite3.Error as error:
+            self.last_error = str(error)
 
     def can_record(self):
         current = time.monotonic()
         if current - self.last_space_check >= STORAGE_CHECK_SECONDS:
             self.last_space_check = current
             try:
-                self.storage_paused = shutil.disk_usage(self.folder).free < MIN_FREE_SPACE_BYTES
+                free = shutil.disk_usage(self.folder).free
+                self.storage_paused = free < MIN_FREE_SPACE_BYTES
+                if free < MIN_FREE_SPACE_BYTES * ACCELERATOR_DISK_MULTIPLIER:
+                    self.maintain(force=True)
             except OSError:
                 self.storage_paused = True
             if self.storage_paused:
@@ -2174,6 +2637,16 @@ class Store:
                     (game, key, label, confidence, evidence))
             self.semantic_version += 1
             self.semantic_route_cache.clear()
+
+    def finish_episode(self, game, world_trace, mouse_trace, keyboard_trace, goal_trace, strategy_trace, outcome):
+        label, confidence = outcome[:2]
+        self.credit_world_episode(game, world_trace, label, confidence)
+        recorded_mouse = self.record_episode(game, mouse_trace, label)
+        self.credit_causal_episode(game, mouse_trace, label)
+        self.credit_keyboard_episode(game, keyboard_trace, label, count_outcome=not bool(recorded_mouse))
+        if not recorded_mouse and not keyboard_trace and world_trace:
+            self.record_verified_outcome(game, label)
+        self.record_goal_outcome(game, goal_trace, label)
 
     def record_episode(self, game, trace, outcome, human=False):
         if outcome not in ("win", "loss") or not trace or not self.can_record():
@@ -2713,7 +3186,7 @@ class Store:
                  0.0 if success else SEQUENCE_FAILURE_WEIGHT * weight,
                  utc_stamp(), identifier))
 
-    def credit_world_goals(self, game, trace, events):
+    def credit_world_goals(self, game, trace, events, include_latest=False):
         if not trace or not events or not self.can_record():
             return 0
         signals = collections.defaultdict(float)
@@ -2726,7 +3199,7 @@ class Store:
             return 0
         records = []
         for age, entry in enumerate(reversed(tuple(trace))):
-            if age == 0:
+            if age == 0 and not include_latest:
                 continue
             if age >= GOAL_CREDIT_HORIZON:
                 break
@@ -2825,9 +3298,13 @@ class Store:
             self.world_cache.clear()
         return len(aggregate)
 
-    def world_routes(self, game, objective="general"):
+    def world_routes(self, game, objective="general", planning_budget_seconds=None):
         objective = objective if objective == "frontier" or objective in GOAL_CATEGORY_PRIORITIES else "general"
-        key = game, objective
+        if planning_budget_seconds is None:
+            planning_budget_seconds = TEMPORAL_INITIAL_COMPUTE_SECONDS
+        planning_budget_seconds = max(TEMPORAL_MIN_INTERVAL_SECONDS,
+                                      min(TEMPORAL_MAX_INTERVAL_SECONDS, planning_budget_seconds))
+        key = game, objective, round(planning_budget_seconds / TEMPORAL_MIN_INTERVAL_SECONDS)
         with self.lock:
             cached = self.world_cache.get(key)
             if cached is not None and self.world_version - cached[0] < WORLD_MODEL_REFRESH_ACTIONS:
@@ -2852,7 +3329,8 @@ class Store:
         for category, source, action, destination, total in goal_rows:
             weight = 1.0 if category == objective else WORLD_MODEL_GOAL_BACKOFF
             goal_values[(source, action, destination)] += weight * total
-        plans = WorldPlanner.routes(rows, goal_values, exploratory=objective == "frontier")
+        plans = WorldPlanner.routes(rows, goal_values, exploratory=objective == "frontier",
+                                    planning_budget_seconds=planning_budget_seconds)
         with self.lock:
             if self.world_version == version:
                 self.world_cache[key] = version, plans
@@ -2864,6 +3342,7 @@ class Store:
     @staticmethod
     def nearest_world_choice(plans, coarse):
         prefix, separator, target = coarse.rpartition("-")
+        target = VisionPolicy.transfer_signature(coarse)
         if not separator or not target.isdigit():
             return None
         prefix += separator
@@ -2873,7 +3352,7 @@ class Store:
                     or len(state) != len(coarse) or entry[0] < WORLD_MODEL_CHOICE_MIN_VALUE
                     or entry[1] < WORLD_MODEL_CHOICE_MIN_CONFIDENCE):
                 continue
-            observed = state[len(prefix):]
+            observed = VisionPolicy.transfer_signature(state)
             if not observed.isdigit():
                 continue
             distance = sum(abs(int(a) - int(b)) for a, b in zip(target, observed))
@@ -2888,8 +3367,9 @@ class Store:
                 best = score, entry
         return best[1] if best is not None else None
 
-    def world_choice(self, game, coarse, signature, objective="general", video=""):
-        plans = self.world_routes(game, objective)
+    def world_choice(self, game, coarse, signature, objective="general", video="",
+                     planning_budget_seconds=None):
+        plans = self.world_routes(game, objective, planning_budget_seconds)
         temporal = (plans.get(coarse + "#" + signature + "#" + video)
                     if signature and video else None)
         exact = plans.get(coarse + "#" + signature) if signature else None
@@ -2914,7 +3394,7 @@ class Store:
         neighbor = self.nearest_world_choice(plans, coarse)
         if neighbor is not None:
             return neighbor
-        frontiers = self.world_routes(game, "frontier")
+        frontiers = self.world_routes(game, "frontier", planning_budget_seconds)
         exploratory = ((frontiers.get(coarse + "#" + signature + "#" + video)
                         if signature and video else None),
                        (frontiers.get(coarse + "#" + signature) if signature else None),
@@ -2997,9 +3477,13 @@ class Store:
         return {(feature, action): (n, effect, human_n, wins, losses)
                 for feature, action, n, effect, human_n, wins, losses in rows}
 
-    def semantic_routes(self, game, objective="general"):
+    def semantic_routes(self, game, objective="general", planning_budget_seconds=None):
         objective = objective if objective in GOAL_CATEGORY_PRIORITIES else "general"
-        cache_key = game, objective
+        if planning_budget_seconds is None:
+            planning_budget_seconds = TEMPORAL_INITIAL_COMPUTE_SECONDS
+        planning_budget_seconds = max(TEMPORAL_MIN_INTERVAL_SECONDS,
+                                      min(TEMPORAL_MAX_INTERVAL_SECONDS, planning_budget_seconds))
+        cache_key = game, objective, round(planning_budget_seconds / TEMPORAL_MIN_INTERVAL_SECONDS)
         with self.lock:
             cached = self.semantic_route_cache.get(cache_key)
             if cached is not None and self.semantic_version - cached[0] < SEMANTIC_ROUTE_REFRESH_ACTIONS:
@@ -3024,7 +3508,7 @@ class Store:
             terminals = self.db.execute(
                 "SELECT state,outcome,confidence,n FROM terminal_states WHERE game=?", (game,)).fetchall()
             version = self.semantic_version
-        plans, goal = LongHorizonPlanner.routes(rows, terminals)
+        plans, goal = LongHorizonPlanner.routes(rows, terminals, planning_budget_seconds)
         with self.lock:
             if version == self.semantic_version:
                 self.semantic_route_cache[cache_key] = (version, plans, goal)
@@ -3810,7 +4294,7 @@ class Store:
         key = game, objective, coarse
         if not coarse:
             return {}
-        target = coarse.rpartition("-")[2]
+        target = VisionPolicy.transfer_signature(coarse)
         if not target or not target.isdigit():
             return {}
         with self.lock:
@@ -3835,7 +4319,7 @@ class Store:
                 (game, WORLD_MODEL_MAX_GOAL_EDGES)).fetchall()
         weights = {}
         for source in set((row[0], row[1]) for row in effect_rows + goal_rows + episode_rows):
-            observed = source[1].rpartition("-")[2]
+            observed = VisionPolicy.transfer_signature(source[1])
             if len(observed) != len(target) or not observed.isdigit():
                 continue
             difference = sum(abs(int(a) - int(b)) for a, b in zip(target, observed))
@@ -3974,7 +4458,7 @@ class Store:
                 self.db.executemany(
                     "INSERT INTO keyboard_episode_credit(game,coarse,chord,n,total,wins,losses) "
                     "VALUES(?,?,?,1,?,?,?) ON CONFLICT(game,coarse,chord) "
-                    "DO UPDATE SET n=n+1,total=total+excluded.total," 
+                    "DO UPDATE SET n=n+1,total=total+excluded.total,"
                     "wins=wins+excluded.wins,losses=losses+excluded.losses", records)
                 self.keyboard_transfer_version += 1
                 if count_outcome:
@@ -4177,6 +4661,8 @@ class Store:
                 'verified': bool(verified_goal), 'causal_confidence': causal_confidence}
             if action not in MOUSE_ACTIONS or not isolated:
                 return reward, visits
+            discount = self.calibration(game_id, coarse_context, 'td_discount', TD_DISCOUNT)['value']
+            alpha = self.calibration(game_id, coarse_context, 'td_learning_rate', TD_LEARNING_RATE)['value']
             if appearance:
                 self.db.execute(
                     "INSERT INTO visual_affordances(game,appearance,action,n,total) VALUES(?,?,?,1,?) "
@@ -4206,8 +4692,8 @@ class Store:
                     "SELECT MAX(value) FROM video_q_values WHERE game=? AND coarse=? AND signature=?",
                     (game_id, next_coarse_context, next_video.signature)).fetchone()
                 next_best = 0.0 if terminal else (next_row[0] or 0.0)
-                goal = reward if terminal else reward + TD_DISCOUNT * next_best
-                rate = TD_LEARNING_RATE / (1.0 + TD_LEARNING_RATE_DECAY * math.sqrt(video_n))
+                goal = reward if terminal else reward + discount * next_best
+                rate = alpha / math.sqrt(video_n + 1)
                 video_value = max(-TD_REWARD_CEILING, min(TD_REWARD_CEILING,
                                   video_old + rate * (goal - video_old)))
                 self.db.execute(
@@ -4306,19 +4792,17 @@ class Store:
                 ).fetchone()
                 next_best = 0.0 if terminal else (next_row[0] or 0.0)
                 immediate = min(TD_REWARD_CEILING, max(-TD_REWARD_CEILING, reward))
-                target = immediate if terminal else immediate + TD_DISCOUNT * next_best
-                learning_rate = TD_LEARNING_RATE / (1.0 + TD_LEARNING_RATE_DECAY * math.sqrt(count))
+                target = immediate if terminal else immediate + discount * next_best
+                learning_rate = alpha / math.sqrt(count + 1)
                 value = min(TD_REWARD_CEILING, max(-TD_REWARD_CEILING, old_value + learning_rate * (target - old_value)))
+                self.calibrate(game_id, coarse_context, 'td_learning_rate',
+                               abs(target - old_value) / (1.0 + abs(target - old_value)),
+                               TD_LEARNING_RATE)
                 q_value = value
                 self.db.execute(
                     "INSERT INTO q_values(context,cell,action,n,value) VALUES(?,?,?,1,?) "
                     "ON CONFLICT(context,cell,action) DO UPDATE SET n=n+1,value=excluded.value",
                     (coarse_context, cell, action, value)
-                )
-            if demonstration_id is not None:
-                self.db.execute(
-                    "UPDATE demonstrations SET replay_n=replay_n+1,replay_effect=replay_effect+? WHERE id=?",
-                    (reward, demonstration_id),
                 )
             trace_values = {}
             if trace and scene_transition and not cyclic_state and reward >= TD_TRACE_MIN_PROGRESS:
@@ -4340,17 +4824,6 @@ class Store:
             self.history_version += 1
             if coarse_context is not None and next_coarse_context is not None or context and next_context:
                 self.model_version += 1
-            if demonstration_id is not None:
-                cached = self.demonstration_cache.get(game_id)
-                if cached is not None:
-                    recent = []
-                    for example in cached[1]:
-                        if example[0] == demonstration_id:
-                            example = example._replace(
-                                replay_n=example.replay_n + 1,
-                                replay_effect=example.replay_effect + reward)
-                        recent.append(example)
-                    self.demonstration_cache[game_id] = (cached[0], recent, cached[2])
             def increment(mapping, key):
                 count, total = mapping.get(key, (0, 0.0))
                 mapping[key] = count + 1, total + reward
@@ -4422,8 +4895,9 @@ class Store:
         if not count:
             return {'actions': 0, 'verified_win_rate': None, 'clear_rate': None,
                     'progress_per_minute': None, 'reward_per_minute': None,
-                    'no_effect_ratio': None, 'mean_decision_latency_seconds': None}
-        wins = losses = clears = noops = 0
+                    'no_effect_ratio': None, 'mean_decision_latency_seconds': None,
+                    'verified_goal_change_count': 0}
+        wins = losses = clears = noops = verified_changes = 0
         seconds = total_reward = progress = 0.0
         latency = []
         for entry in items:
@@ -4436,7 +4910,9 @@ class Store:
             goal_changes = entry.get('goal_changes') or ()
             for goal in goal_changes:
                 if isinstance(goal, dict):
-                    progress += objective_signal(goal)
+                    signal = objective_signal(goal)
+                    progress += signal
+                    verified_changes += int(signal != 0.0)
             outcome = entry.get('outcome')
             if isinstance(outcome, (list, tuple)) and len(outcome) >= 3:
                 if outcome[0] == 'win':
@@ -4446,7 +4922,7 @@ class Store:
                 elif outcome[0] == 'loss':
                     losses += 1
             effect = entry.get('visual_effect')
-            noops += int((not isinstance(effect, (float, int)) or
+            noops += int(not entry.get('transition') and (not isinstance(effect, (float, int)) or
                           effect < VISUAL_EFFECT_THRESHOLD) and not goal_changes
                          and not (isinstance(outcome, (list, tuple)) and outcome[0] == 'win'))
             delay = entry.get('decision_latency_seconds')
@@ -4457,6 +4933,7 @@ class Store:
                 'verified_win_rate': wins / episodes if episodes else None,
                 'clear_rate': clears / episodes if episodes else None,
                 'net_verified_goal_progress': progress,
+                'verified_goal_change_count': verified_changes,
                 'progress_per_minute': progress * SECONDS_PER_MINUTE / seconds if seconds else None,
                 'reward_per_minute': total_reward * SECONDS_PER_MINUTE / seconds if seconds else None,
                 'no_effect_ratio': noops / count,
@@ -4472,94 +4949,484 @@ class Store:
                       else None) for key in keys}
 
     def evaluation_snapshot(self):
+        self.flush_learning()
         with self.lock:
-            rows = self.db.execute(
-                "SELECT id,time,payload FROM events WHERE kind='action' "
-                "ORDER BY id DESC LIMIT ?", (EVALUATION_EVENT_LIMIT,)).fetchall()
-        actions = []
-        scenarios = collections.defaultdict(list)
-        for identifier, timestamp, raw in reversed(rows):
+            rows = self.db.execute("SELECT id,time,kind,payload FROM events ORDER BY id").fetchall()
+            stored_sessions = self.db.execute(
+                "SELECT session_id,started,ended,elapsed,status FROM agent_sessions").fetchall()
+        sessions = {key: {'session_id': key, 'started': started, 'ended': ended,
+                          'elapsed': elapsed, 'status': status, 'basis': 'monotonic_session'}
+                    for key, started, ended, elapsed, status in stored_sessions}
+        actions_by_key = {}
+        attempt_states = {}
+        delayed = []
+        evaluated_episodes = []
+        reasons = collections.Counter()
+        phase_totals = collections.defaultdict(float)
+        active = None
+        session_events = set()
+        def timestamp(value):
             try:
-                payload = json.loads(raw)
+                return datetime.datetime.fromisoformat(value).timestamp()
+            except (ValueError, TypeError, OverflowError):
+                return None
+        def finish_legacy(end, stopped):
+            if active is None:
+                return
+            key = active['session_id']
+            if key not in sessions:
+                start_seconds, end_seconds = timestamp(active['started']), timestamp(end)
+                elapsed = (max(0.0, end_seconds - start_seconds)
+                           if start_seconds is not None and end_seconds is not None else 0.0)
+                sessions[key] = dict(active, ended=end if stopped else None,
+                                     elapsed=elapsed, status='stopped' if stopped else 'incomplete',
+                                     basis='legacy_event_timestamps')
+        for identifier, recorded, kind, raw in rows:
+            try:
+                item = json.loads(raw)
             except (ValueError, TypeError):
                 continue
-            if not isinstance(payload, dict):
+            if not isinstance(item, dict):
                 continue
-            actions.append(payload)
-            game = payload.get('game_id') or str(payload.get('coarse_context', '')).rpartition('-')[0]
-            scene = payload.get('coarse_context')
+            if kind == 'start':
+                key = item.get('session_id')
+                if active is None or key != active['session_id']:
+                    if active is not None:
+                        finish_legacy(recorded, False)
+                    active = {'session_id': key or 'legacy:' + str(identifier), 'started': recorded}
+                session_events.add(active['session_id'])
+            if active is not None and str(active['session_id']).startswith('legacy:') and item.get('session_id'):
+                session_events.discard(active['session_id'])
+                active['session_id'] = item['session_id']
+                session_events.add(active['session_id'])
+            key = (item.get('session_id') or (active['session_id'] if active else None),
+                   item.get('decision_id'))
+            if kind in ('action_started', 'action_finished') and all(value is not None for value in key):
+                state = attempt_states.setdefault(key, {})
+                state.update(item)
+                if kind == 'action_finished':
+                    reasons[item.get('reason') or item.get('error') or item.get('status', 'unknown')] += 1
+                    for phase, elapsed in item.get('phase_seconds', {}).items():
+                        if isinstance(elapsed, (int, float)) and math.isfinite(elapsed) and elapsed >= 0.0:
+                            phase_totals[phase] += elapsed
+            elif kind == 'action':
+                actions_by_key[key if all(value is not None for value in key) else ('event', identifier)] = item
+            elif kind == 'delayed_feedback':
+                delayed.append(item)
+            elif kind == 'evaluated_episode':
+                evaluated_episodes.append(item)
+            elif kind == 'stop':
+                finish_legacy(recorded, True)
+                active = None
+        if active is not None and rows:
+            finish_legacy(rows[-1][1], False)
+        actions = [item for key, item in actions_by_key.items()
+                   if key not in attempt_states or attempt_states[key].get('status') == 'completed']
+        valid_samples = self.summarize_evaluation(actions)
+        represented = session_events | {key[0] for key in attempt_states}
+        represented.update(item.get('session_id') for item in actions)
+        sessions = {key: row for key, row in sessions.items() if key in represented}
+        rates_complete = bool(sessions) and all(key in session_events for key in sessions)
+        wall_seconds = sum(max(0.0, row['elapsed']) for row in sessions.values())
+        totals = dict(valid_samples)
+        delayed_progress = sum(objective_signal(goal) for item in delayed
+                               for goal in item.get('goal_changes', ()) if isinstance(goal, dict))
+        delayed_changes = sum(objective_signal(goal) != 0.0 for item in delayed
+                              for goal in item.get('goal_changes', ()) if isinstance(goal, dict))
+        totals['net_verified_goal_progress'] = totals.get('net_verified_goal_progress', 0.0) + delayed_progress
+        totals['verified_goal_change_count'] += delayed_changes
+        total_reward = sum(item.get('visual_reward', 0.0) for item in actions
+                           if isinstance(item.get('visual_reward'), (int, float))
+                           and math.isfinite(item['visual_reward']))
+        totals.update({'observed_seconds': wall_seconds, 'wall_clock_seconds': wall_seconds,
+                       'time_basis': 'complete_sessions_and_observed_incomplete_sessions',
+                       'progress_per_minute': totals['net_verified_goal_progress'] * SECONDS_PER_MINUTE / wall_seconds
+                                              if wall_seconds else None,
+                       'reward_per_minute': total_reward * SECONDS_PER_MINUTE / wall_seconds if wall_seconds else None,
+                       'attempts_per_minute': len(attempt_states) * SECONDS_PER_MINUTE / wall_seconds if wall_seconds else None,
+                       'completed_actions_per_minute': len(actions) * SECONDS_PER_MINUTE / wall_seconds if wall_seconds else None,
+                       'delayed_verified_goal_progress': delayed_progress})
+        totals['rates_complete'] = rates_complete
+        if not rates_complete:
+            for name in ('progress_per_minute', 'reward_per_minute', 'attempts_per_minute',
+                         'completed_actions_per_minute'):
+                totals[name] = None
+        scenarios = collections.defaultdict(list)
+        methods = collections.defaultdict(list)
+        for item in actions:
+            game = item.get('game_id') or str(item.get('coarse_context', '')).rpartition('-')[0]
+            scene = item.get('coarse_context')
             if game and scene:
-                scenarios[(game, scene, payload.get('active_objective') or 'general')].append(payload)
-        results = []
-        transfer = []
+                scenarios[(game, scene, item.get('active_objective') or 'general')].append(item)
+            methods[str(item.get('decision_source') or 'unknown')].append(item)
+        results, transfer = [], []
         for (game, scene, objective), records in scenarios.items():
             if len(records) >= EVALUATION_SCENARIO_MIN_OBSERVATIONS:
                 midpoint = len(records) // 2
-                early = self.summarize_evaluation(records[:midpoint])
-                late = self.summarize_evaluation(records[midpoint:])
+                early, late = self.summarize_evaluation(records[:midpoint]), self.summarize_evaluation(records[midpoint:])
                 results.append({'game': game, 'scene': scene, 'objective': objective,
-                                'earlier': early, 'later': late,
+                                'time_basis': 'valid_samples_only', 'earlier': early, 'later': late,
                                 'later_minus_earlier': self.evaluation_delta(early, late)})
-            with_transfer = [item for item in records if item.get('crossgame_transfer_used')]
-            without_transfer = [item for item in records if not item.get('crossgame_transfer_used')]
-            if (len(with_transfer) >= EVALUATION_MATCHED_TRANSFER_MIN_OBSERVATIONS and
-                    len(without_transfer) >= EVALUATION_MATCHED_TRANSFER_MIN_OBSERVATIONS):
-                guided = self.summarize_evaluation(with_transfer)
-                baseline = self.summarize_evaluation(without_transfer)
+            guided = [item for item in records if item.get('crossgame_transfer_used')]
+            baseline = [item for item in records if not item.get('crossgame_transfer_used')]
+            if min(len(guided), len(baseline)) >= EVALUATION_MATCHED_TRANSFER_MIN_OBSERVATIONS:
+                guided, baseline = self.summarize_evaluation(guided), self.summarize_evaluation(baseline)
                 transfer.append({'game': game, 'scene': scene, 'objective': objective,
-                                 'transfer': guided, 'local_baseline': baseline,
+                                 'time_basis': 'valid_samples_only', 'transfer': guided, 'local_baseline': baseline,
                                  'transfer_minus_baseline': self.evaluation_delta(baseline, guided)})
         results.sort(key=lambda row: row['earlier']['actions'] + row['later']['actions'], reverse=True)
         transfer.sort(key=lambda row: row['transfer']['actions'], reverse=True)
-        return {'basis': 'recorded_actions_replay',
-                'limitations': '配对场景的观察性对比，非随机化实验；胜率仅统计已确认胜负，未知不算胜负；跨游戏迁移对照不等于因果证明',
-                'events': len(actions), 'totals': self.summarize_evaluation(actions),
-                'matched_scenarios': results[:EVALUATION_SCENARIO_MAX_RESULTS],
+        episode_groups = collections.defaultdict(list)
+        for episode in evaluated_episodes:
+            episode_groups[(episode.get('game'), episode.get('initial_state'), episode.get('objective'))].append(episode)
+        paired_episodes = []
+        for (game, state, objective), records in episode_groups.items():
+            groups = {'untrained_start': [row for row in records if row.get('training_updates_at_start') == 0],
+                      'learned_start': [row for row in records if row.get('training_updates_at_start', 0) > 0]}
+            summary = {}
+            for name, entries in groups.items():
+                wins = sum(entry['outcome'][0] == 'win' for entry in entries)
+                losses = sum(entry['outcome'][0] == 'loss' for entry in entries)
+                total = wins + losses
+                summary[name] = {'verified_episodes': total, 'success_rate': wins / total if total else None,
+                                 'failure_rate': losses / total if total else None,
+                                 'mean_seconds': sum(entry['elapsed'] for entry in entries) / len(entries) if entries else None}
+            paired_episodes.append({'game': game, 'initial_visual_state': state, 'objective': objective,
+                                    'comparable': all(summary[name]['verified_episodes'] for name in summary), **summary})
+        return {'basis': 'observational_event_summary',
+                'initial_state_episode_comparisons': paired_episodes,
+                'initial_state_comparison_limitations': '仅匹配可见初始状态；未重置游戏隐藏状态，不构成受控因果实验。',
+                'state_encoding_version': STATE_ENCODING_VERSION,
+                'execution': {'attempts': len(attempt_states),
+                              'statuses': dict(collections.Counter(item.get('status', 'started') for item in attempt_states.values())),
+                              'reasons': dict(reasons), 'phase_seconds': dict(phase_totals),
+                              'completed_feedback_ratio': len(actions) / len(attempt_states) if attempt_states else None},
+                'limitations': '历史事件汇总，不是可重复执行的回放实验；场景与方法对比仅包含有效样本；未知结果不计入胜负。',
+                'events': len(actions), 'totals': totals, 'valid_samples': valid_samples,
+                'sessions': list(sessions.values()), 'matched_scenarios': results[:EVALUATION_SCENARIO_MAX_RESULTS],
                 'matched_crossgame_transfer': transfer[:EVALUATION_SCENARIO_MAX_RESULTS],
-                'coverage': {'games': len({key[0] for key in scenarios}),
-                             'repeated_scenarios': len(results),
-                             'transfer_comparisons': len(transfer)}}
+                'decision_methods': {source: dict(self.summarize_evaluation(records), time_basis='valid_samples_only')
+                                     for source, records in methods.items()},
+                'coverage': {'games': len({key[0] for key in scenarios}), 'repeated_scenarios': len(results),
+                             'transfer_comparisons': len(transfer),
+                             'session_start_events_present': all(key in session_events for key in sessions),
+                             'incomplete_sessions': sum(row['status'] != 'stopped' for row in sessions.values()),
+                             'retained_event_count': len(rows)}}
 
-    def export(self, desktop, info, preview, evaluation=None):
-        snapshot = self.folder / ("snapshot-" + uuid.uuid4().hex + ".sqlite3")
-        target = Path(desktop) / ("Agent黑匣子-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex + ".zip")
-        partial = target.with_suffix(".zip.part")
+    def export(self, desktop, info, preview, evaluation=None, recent_frames=(), progress=None, native=None):
+        snapshot = self.folder / ('snapshot-' + uuid.uuid4().hex + '.sqlite3')
+        target = (Path(desktop) / ('Agent黑匣子-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+                                   + '-' + uuid.uuid4().hex + '.zip'))
+        partial = target.with_suffix('.zip.part')
+        snapshot_view = None
+        last_report = [0.0, None, 0.0]
+        def report(stage, percent=None):
+            if progress is None:
+                return
+            now = time.monotonic()
+            percent = last_report[2] if percent is None else max(last_report[2], min(PERCENT_SCALE, percent))
+            if stage != last_report[1] or now - last_report[0] >= UI_TICK_MS / MILLISECONDS_PER_SECOND:
+                last_report[:] = [now, stage, percent]
+                progress(stage, round(percent))
+        def serialize(data):
+            def finite(value):
+                if isinstance(value, float) and not math.isfinite(value):
+                    return str(value)
+                if isinstance(value, dict):
+                    return {str(key): finite(item) for key, item in value.items()}
+                if isinstance(value, (list, tuple)):
+                    return [finite(item) for item in value]
+                return value
+            return json.dumps(finite(data), ensure_ascii=False, indent=BLACKBOX_JSON_INDENT,
+                              allow_nan=False, default=str).encode('utf-8')
         try:
+            report('正在创建数据库一致性快照', 1)
             with self.lock:
                 backup = sqlite3.connect(snapshot)
                 try:
-                    self.db.backup(backup)
+                    def backup_progress(status, remaining, total):
+                        report('正在创建数据库一致性快照', 1 + (1.0 - remaining / max(1, total))
+                               * BLACKBOX_SNAPSHOT_PROGRESS_SHARE)
+                    self.db.backup(backup, pages=DB_WAL_PAGES, progress=backup_progress)
                 finally:
                     backup.close()
-                recent = self.db.execute(
-                    "SELECT time,kind,payload FROM events ORDER BY id DESC LIMIT ?",
-                    (BLACKBOX_RECENT_EVENT_LIMIT,)
-                ).fetchall()
-            events = []
-            for stamp, kind, payload in reversed(recent):
-                try:
-                    content = json.loads(payload)
-                except (ValueError, TypeError):
-                    content = payload
-                events.append(json.dumps({"time": stamp, "kind": kind, "payload": content}, ensure_ascii=False) + "\n")
+            snapshot_view = copy.copy(self)
+            snapshot_view.db = sqlite3.connect(snapshot)
+            snapshot_view.lock = threading.RLock()
+            snapshot_view.write_service = snapshot_view.neural_service = None
+            report('正在评估学习效果', 12)
             if evaluation is None:
-                evaluation = self.evaluation_snapshot()
-            with zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                archive.write(snapshot, "experience.sqlite3")
-                archive.writestr("evaluation.json", json.dumps(
-                    evaluation, ensure_ascii=False, indent=BLACKBOX_JSON_INDENT))
-                archive.writestr("runtime.json", json.dumps(info, ensure_ascii=False, indent=BLACKBOX_JSON_INDENT))
-                archive.writestr("recent_events.jsonl", "".join(events))
-                archive.write(Path(__file__), Path(__file__).name)
+                try:
+                    evaluation = snapshot_view.evaluation_snapshot()
+                except Exception as error:
+                    evaluation = {'error': type(error).__name__ + ': ' + str(error),
+                                  'events': None, 'totals': None, 'coverage': None}
+            info = dict(info)
+            info['observational_evaluation'] = {
+                'events': evaluation.get('events'), 'totals': evaluation.get('totals'),
+                'coverage': evaluation.get('coverage')}
+            report('正在采集操作系统及硬件细节', 18)
+            try:
+                hardware = DeviceDiagnostics.collect(self.folder, native,
+                                                      lambda stage, percent: report(stage, percent))
+            except Exception as error:
+                hardware = {'collected_utc': utc_stamp(), 'sources': {},
+                            'collection_errors': {'collector': type(error).__name__ + ': ' + str(error)},
+                            'successful_sections': 0, 'failed_sections': 1}
+            report('正在整理黑匣子证据', 38)
+            catalog = []
+            def append_digest(name, size, digest):
+                catalog.append({'name': name, 'size_bytes': size, 'sha256': digest.hexdigest()})
+            with zipfile.ZipFile(partial, 'w', compression=zipfile.ZIP_DEFLATED,
+                                 allowZip64=True) as archive:
+                def add_bytes(name, payload):
+                    digest = hashlib.sha256(payload)
+                    archive.writestr(name, payload)
+                    append_digest(name, len(payload), digest)
+                def add_json(name, value):
+                    add_bytes(name, serialize(value))
+                def add_file(name, path):
+                    digest = hashlib.sha256()
+                    size = 0
+                    with open(path, 'rb') as source, archive.open(name, 'w', force_zip64=True) as destination:
+                        while True:
+                            part = source.read(BLACKBOX_STREAM_CHUNK_BYTES)
+                            if not part:
+                                break
+                            destination.write(part)
+                            digest.update(part)
+                            size += len(part)
+                    append_digest(name, size, digest)
+                add_file('experience.sqlite3', snapshot)
+                add_json('runtime.json', info)
+                add_json('device_information.json', hardware)
+                add_json('evaluation.json', evaluation)
+                add_json('evaluation/heldout_prediction.json', snapshot_view.holdout_evaluation())
+                add_json('evaluation/checkpoint.json', snapshot_view.checkpoint_metadata())
+                add_json('ui_diagnostics.json', info.get('ui_diagnostics', {}))
+                report('正在汇总数据库结构与记录数量', 43)
+                reader = sqlite3.connect(snapshot)
+                try:
+                    reader.row_factory = sqlite3.Row
+                    rows = reader.execute("SELECT type,name,tbl_name,sql FROM sqlite_master "
+                                          "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").fetchall()
+                    schema = [{'type': row['type'], 'name': row['name'],
+                               'table': row['tbl_name'], 'sql': row['sql']} for row in rows]
+                    tables = {}
+                    for row in rows:
+                        if row['type'] != 'table':
+                            continue
+                        table_name = row['name']
+                        quoted = '"' + table_name.replace('"', '""') + '"'
+                        tables[table_name] = {
+                            'rows': reader.execute('SELECT COUNT(*) FROM ' + quoted).fetchone()[0],
+                            'columns': [dict(item) for item in reader.execute('PRAGMA table_info(' + quoted + ')')],
+                            'indexes': [dict(item) for item in reader.execute('PRAGMA index_list(' + quoted + ')')],
+                        }
+                    db_overview = {
+                        'snapshot_bytes': snapshot.stat().st_size,
+                        'sqlite_version': sqlite3.sqlite_version,
+                        'page_size': reader.execute('PRAGMA page_size').fetchone()[0],
+                        'page_count': reader.execute('PRAGMA page_count').fetchone()[0],
+                        'freelist_count': reader.execute('PRAGMA freelist_count').fetchone()[0],
+                        'quick_check': [row[0] for row in reader.execute('PRAGMA quick_check')],
+                        'tables': tables, 'objects': schema,
+                    }
+                    add_json('database_overview.json', db_overview)
+                    add_bytes('database_schema.sql', ('\n\n'.join(row['sql'] + ';' for row in schema
+                                                    if row['sql']) + '\n').encode('utf-8'))
+                    report('正在导出全部事件时间线', 51)
+                    recent = collections.deque(maxlen=BLACKBOX_RECENT_EVENT_LIMIT)
+                    kinds = collections.Counter()
+                    actions_by_game = collections.Counter()
+                    actions_by_type = collections.Counter()
+                    actions_by_control = collections.Counter()
+                    actions_by_decision = collections.Counter()
+                    error_events = collections.Counter()
+                    first_stamp = last_stamp = None
+                    event_count = action_count = 0
+                    reward_sum = effect_sum = 0.0
+                    digest = hashlib.sha256()
+                    size = 0
+                    with archive.open('events/all_events.jsonl', 'w', force_zip64=True) as stream:
+                        cursor = reader.execute('SELECT id,time,kind,payload FROM events ORDER BY id')
+                        while True:
+                            part = cursor.fetchmany(BLACKBOX_EVENT_BATCH)
+                            if not part:
+                                break
+                            for event_id, stamp, kind, raw in part:
+                                try:
+                                    payload = json.loads(raw)
+                                except (ValueError, TypeError):
+                                    payload = raw
+                                event_data = {'id': event_id, 'time': stamp, 'kind': kind,
+                                              'payload': payload}
+                                try:
+                                    line = json.dumps(event_data, ensure_ascii=False,
+                                                      allow_nan=False, default=str).encode('utf-8') + b'\n'
+                                except (ValueError, TypeError):
+                                    event_data['payload'] = raw
+                                    line = json.dumps(event_data, ensure_ascii=False,
+                                                      allow_nan=False, default=str).encode('utf-8') + b'\n'
+                                stream.write(line)
+                                digest.update(line)
+                                size += len(line)
+                                recent.append(line)
+                                event_count += 1
+                                kinds[kind] += 1
+                                first_stamp = stamp if first_stamp is None else first_stamp
+                                last_stamp = stamp
+                                if 'error' in kind.lower() or 'fail' in kind.lower():
+                                    error_events[kind] += 1
+                                if kind == 'action' and isinstance(payload, dict):
+                                    action_count += 1
+                                    actions_by_game[str(payload.get('game_id') or 'unknown')] += 1
+                                    actions_by_type[str(payload.get('action') or 'unknown')] += 1
+                                    actions_by_control[str(payload.get('control_mode') or 'unknown')] += 1
+                                    actions_by_decision[str(payload.get('decision_source') or 'unknown')] += 1
+                                    for name in ('visual_reward', 'visual_effect'):
+                                        value = payload.get(name)
+                                        if isinstance(value, (int, float)) and math.isfinite(value):
+                                            if name == 'visual_reward':
+                                                reward_sum += value
+                                            else:
+                                                effect_sum += value
+                            report('正在导出全部事件时间线', 51 + min(1.0, event_count /
+                                   max(1, tables.get('events', {}).get('rows', 1))) * 12)
+                    append_digest('events/all_events.jsonl', size, digest)
+                    add_bytes('recent_events.jsonl', b''.join(recent))
+                    timeline = {'event_count': event_count, 'action_count': action_count,
+                                'first_event_utc': first_stamp, 'last_event_utc': last_stamp,
+                                'event_types': dict(kinds), 'errors_by_kind': dict(error_events),
+                                'actions_by_game': dict(actions_by_game),
+                                'actions_by_type': dict(actions_by_type),
+                                'actions_by_control_mode': dict(actions_by_control),
+                                'actions_by_decision_source': dict(actions_by_decision),
+                                'mean_recorded_reward': reward_sum / action_count if action_count else None,
+                                'mean_visual_effect': effect_sum / action_count if action_count else None,
+                                'recent_events_limit': BLACKBOX_RECENT_EVENT_LIMIT,
+                                'all_event_history_is_in_sqlite': True}
+                    add_json('events/timeline_summary.json', timeline)
+                    report('正在生成可筛选的操作时间表', 65)
+                    columns = BLACKBOX_ACTION_CSV_COLUMNS
+                    digest = hashlib.sha256()
+                    size = 0
+                    buffer = io.StringIO(newline='')
+                    writer = csv.writer(buffer)
+                    def csv_output(stream, values):
+                        nonlocal size
+                        buffer.seek(0)
+                        buffer.truncate(0)
+                        writer.writerow(values)
+                        value = buffer.getvalue().encode('utf-8')
+                        stream.write(value)
+                        digest.update(value)
+                        size += len(value)
+                    with archive.open('events/actions.csv', 'w', force_zip64=True) as stream:
+                        csv_output(stream, columns)
+                        cursor = reader.execute("SELECT id,time,payload FROM events WHERE kind='action' ORDER BY id")
+                        while True:
+                            part = cursor.fetchmany(BLACKBOX_EVENT_BATCH)
+                            if not part:
+                                break
+                            for identifier, stamp, raw in part:
+                                try:
+                                    payload = json.loads(raw)
+                                except (ValueError, TypeError):
+                                    continue
+                                if not isinstance(payload, dict):
+                                    continue
+                                origin = payload.get('from')
+                                destination = payload.get('to')
+                                origin = origin if isinstance(origin, (tuple, list)) else ()
+                                destination = destination if isinstance(destination, (tuple, list)) else ()
+                                selected = {**payload, 'id': identifier, 'time': stamp,
+                                            'from_x': origin[0] if len(origin) > 0 else None,
+                                            'from_y': origin[1] if len(origin) > 1 else None,
+                                            'to_x': destination[0] if len(destination) > 0 else None,
+                                            'to_y': destination[1] if len(destination) > 1 else None}
+                                csv_output(stream, [json.dumps(selected[name], ensure_ascii=False,
+                                                               separators=(',', ':'), default=str)
+                                                    if isinstance(selected.get(name), (dict, list, tuple))
+                                                    else selected.get(name, '') for name in columns])
+                    append_digest('events/actions.csv', size, digest)
+                finally:
+                    reader.close()
+                report('正在写入原始程序与画面证据', 76)
+                try:
+                    add_file('source/' + Path(__file__).name, Path(__file__))
+                except OSError as error:
+                    add_json('source/source_capture_error.json', {
+                        'error': type(error).__name__ + ': ' + str(error)})
                 if preview:
-                    archive.writestr("last_capture.ppm", preview)
+                    add_bytes('images/last_capture.ppm', preview)
+                    add_bytes('last_capture.ppm', preview)
+                if recent_frames:
+                    frame_manifest = []
+                    for index, record in enumerate(recent_frames):
+                        metadata, before_png, after_png = record[:3]
+                        stem = f'frames/{index:03d}'
+                        add_bytes(stem + '-before.png', before_png)
+                        if after_png is not None:
+                            add_bytes(stem + '-after.png', after_png)
+                        detail_paths = []
+                        for detail_index, (phase, bounds, frame_id, data) in enumerate(record[3] if len(record) > 3 else ()):
+                            path = stem + '-' + phase + '-detail-' + str(detail_index) + '.png'
+                            add_bytes(path, data)
+                            detail_paths.append({'phase': phase, 'bounds': bounds, 'frame_id': frame_id, 'path': path})
+                        frame_manifest.append({**metadata, 'details': detail_paths, 'before': stem + '-before.png',
+                                               'after': stem + '-after.png' if after_png is not None else None})
+                        report('正在写入前后画面对照', 77 + (index + 1) /
+                               len(recent_frames) * 12)
+                    add_json('frames/index.json', frame_manifest)
+                add_bytes('README.txt', (
+                    'Agent 黑匣子\n'
+                    'experience.sqlite3：所有当前持久化学习表、观察记录与事件。\n'
+                    'events/all_events.jsonl：数据库中全部保留事件，按 ID 顺序排列。\n'
+                    'events/actions.csv：便于检索和筛选的动作指标。\n'
+                    'events/timeline_summary.json：时间线、动作/控制方式/决策来源统计。\n'
+                    'device_information.json：Windows、硬件、驱动、显示器、磁盘、网络、Python、进程信息。\n'
+                    'database_overview.json / database_schema.sql：数据库结构、行数、完整性检查。\n'
+                    'runtime.json / evaluation.json：Agent 状态、学习统计与观察性评估。\n'
+                    'frames/index.json：近期动作前后画面，若采集成功才会出现。\n'
+                    'manifest.json：文件清单、SHA-256 校验值及敏感信息提示。\n'
+                    '注意：本文件夹可能包含硬件序列号、IP/MAC、设备 UUID、游戏截图、窗口标题及本机路径。'
+                    '请在分享前审查；不主动采集密码或 API 密钥。\n'
+                ).encode('utf-8'))
+                report('正在生成文件校验清单', 91)
+                manifest = {
+                    'format_version': BLACKBOX_BUNDLE_VERSION,
+                    'created_utc': utc_stamp(), 'agent_source_name': Path(__file__).name,
+                    'event_count': event_count, 'action_count': action_count,
+                    'device_sections': hardware['successful_sections'],
+                    'device_collection_failures': hardware['collection_errors'],
+                    'sensitive_contents': ['game_screenshots', 'local_paths', 'hardware_identifiers',
+                                           'network_addresses', 'window_titles', 'event_payloads'],
+                    'entries': catalog,
+                }
+                archive.writestr('manifest.json', serialize(manifest))
+            report('正在校验压缩包完整性', 95)
+            with zipfile.ZipFile(partial, 'r') as verification:
+                damaged = verification.testzip()
+                if damaged is not None:
+                    raise zipfile.BadZipFile('压缩包校验失败：' + damaged)
             os.replace(partial, target)
+            report('黑匣子已完成', PERCENT_SCALE)
             return target
         finally:
+            if snapshot_view is not None:
+                snapshot_view.db.close()
             snapshot.unlink(missing_ok=True)
             partial.unlink(missing_ok=True)
 
     def close(self):
+        if self.write_service is not None:
+            self.write_service.close()
+        if self.neural_service is not None:
+            self.neural_service.close()
+        worker = self.maintenance_worker
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join()
         with self.lock:
             self.db.close()
 
@@ -4799,6 +5666,367 @@ class FileTime(C.Structure):
         return (self.high << (BITS_PER_BYTE * BYTES_PER_COLOR_PIXEL)) | self.low
 
 
+class DeviceDiagnostics:
+    CIM_GROUPS = {
+        'Win32_ComputerSystem': ('Name', 'Manufacturer', 'Model', 'SystemType', 'TotalPhysicalMemory', 'Domain', 'PartOfDomain', 'PCSystemType', 'HypervisorPresent', 'NumberOfProcessors', 'NumberOfLogicalProcessors'),
+        'Win32_ComputerSystemProduct': ('Vendor', 'Name', 'Version', 'IdentifyingNumber', 'UUID'),
+        'Win32_OperatingSystem': ('Caption', 'Version', 'BuildNumber', 'OSArchitecture', 'InstallDate', 'LastBootUpTime', 'FreePhysicalMemory', 'TotalVisibleMemorySize', 'FreeVirtualMemory', 'TotalVirtualMemorySize', 'Locale', 'OSLanguage', 'MUILanguages', 'SystemDirectory'),
+        'Win32_BIOS': ('Manufacturer', 'Name', 'SMBIOSBIOSVersion', 'ReleaseDate', 'SerialNumber', 'Version', 'SMBIOSMajorVersion', 'SMBIOSMinorVersion'),
+        'Win32_BaseBoard': ('Manufacturer', 'Product', 'Version', 'SerialNumber'),
+        'Win32_Processor': ('Name', 'Manufacturer', 'Description', 'DeviceID', 'ProcessorId', 'NumberOfCores', 'NumberOfLogicalProcessors', 'MaxClockSpeed', 'CurrentClockSpeed', 'LoadPercentage', 'SocketDesignation', 'L2CacheSize', 'L3CacheSize', 'Architecture', 'VirtualizationFirmwareEnabled', 'SecondLevelAddressTranslationExtensions'),
+        'Win32_PhysicalMemory': ('Manufacturer', 'PartNumber', 'Capacity', 'Speed', 'ConfiguredClockSpeed', 'SMBIOSMemoryType', 'FormFactor', 'BankLabel', 'DeviceLocator', 'SerialNumber'),
+        'Win32_VideoController': ('Name', 'AdapterRAM', 'DriverVersion', 'DriverDate', 'VideoProcessor', 'CurrentHorizontalResolution', 'CurrentVerticalResolution', 'CurrentRefreshRate', 'CurrentBitsPerPixel', 'VideoModeDescription', 'PNPDeviceID', 'AdapterCompatibility', 'Status'),
+        'Win32_DiskDrive': ('Model', 'Manufacturer', 'MediaType', 'InterfaceType', 'Size', 'BytesPerSector', 'Partitions', 'FirmwareRevision', 'SerialNumber', 'PNPDeviceID', 'Status'),
+        'Win32_LogicalDisk': ('DeviceID', 'FileSystem', 'Size', 'FreeSpace', 'VolumeName', 'VolumeSerialNumber', 'DriveType'),
+        'Win32_NetworkAdapter': ('Name', 'Manufacturer', 'NetConnectionID', 'MACAddress', 'Speed', 'AdapterType', 'PhysicalAdapter', 'NetEnabled', 'PNPDeviceID'),
+        'Win32_NetworkAdapterConfiguration': ('Description', 'DHCPEnabled', 'DHCPServer', 'IPAddress', 'IPSubnet', 'DefaultIPGateway', 'DNSServerSearchOrder', 'MACAddress', 'IPEnabled', 'DNSDomain'),
+        'Win32_SoundDevice': ('Name', 'Manufacturer', 'ProductName', 'Status'),
+        'Win32_DesktopMonitor': ('Name', 'MonitorType', 'ScreenWidth', 'ScreenHeight', 'PNPDeviceID', 'Status'),
+        'Win32_Battery': ('BatteryStatus', 'EstimatedChargeRemaining', 'DesignCapacity', 'FullChargeCapacity', 'EstimatedRunTime', 'Chemistry'),
+    }
+    CIM_DRIVERS = {
+        'Win32_PnPSignedDriver': ('DeviceName', 'DeviceClass', 'Manufacturer', 'DriverProviderName', 'DriverVersion', 'DriverDate', 'InfName', 'IsSigned', 'DeviceID'),
+        'Win32_PnPEntity': ('Name', 'Manufacturer', 'PNPClass', 'PNPDeviceID', 'Status', 'ConfigManagerErrorCode'),
+    }
+
+    @staticmethod
+    def registry():
+        import winreg
+        sources = {
+            'windows_version': (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows NT\CurrentVersion',
+                                ('ProductName', 'DisplayVersion', 'ReleaseId', 'CurrentBuild', 'CurrentBuildNumber', 'UBR', 'EditionID', 'InstallationType', 'BuildLabEx', 'InstallDate')),
+            'system_bios': (winreg.HKEY_LOCAL_MACHINE, r'HARDWARE\DESCRIPTION\System\BIOS',
+                            ('SystemManufacturer', 'SystemProductName', 'SystemVersion', 'BaseBoardManufacturer', 'BaseBoardProduct', 'BIOSVendor', 'BIOSVersion', 'BIOSReleaseDate')),
+            'cpu_registry': (winreg.HKEY_LOCAL_MACHINE, r'HARDWARE\DESCRIPTION\System\CentralProcessor\0',
+                             ('ProcessorNameString', 'VendorIdentifier', 'Identifier', '~MHz', 'Update Revision')),
+            'computer_identity': (winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName', ('ComputerName',)),
+        }
+        output = {}
+        failures = {}
+        for group, (root, key, names) in sources.items():
+            try:
+                with winreg.OpenKey(root, key) as entry:
+                    values = {}
+                    for name in names:
+                        try:
+                            data = winreg.QueryValueEx(entry, name)[0]
+                            values[name] = data.hex() if isinstance(data, bytes) else data
+                        except OSError:
+                            continue
+                    output[group] = values
+            except OSError as error:
+                failures[group] = str(error)
+        return {'values': output, 'errors': failures}
+
+    @staticmethod
+    def api_memory():
+        kernel = C.WinDLL('kernel32', use_last_error=True)
+        memory = MemoryStatus()
+        memory.length = C.sizeof(memory)
+        kernel.GlobalMemoryStatusEx.argtypes = [C.POINTER(MemoryStatus)]
+        if not kernel.GlobalMemoryStatusEx(C.byref(memory)):
+            raise C.WinError(C.get_last_error())
+        output = {name: getattr(memory, name) for name, _ in MemoryStatus._fields_}
+        class Performance(C.Structure):
+            _fields_ = [('cb', C.c_uint32), ('commit_total', C.c_size_t),
+                        ('commit_limit', C.c_size_t), ('commit_peak', C.c_size_t),
+                        ('physical_total', C.c_size_t), ('physical_available', C.c_size_t),
+                        ('system_cache', C.c_size_t), ('kernel_total', C.c_size_t),
+                        ('kernel_paged', C.c_size_t), ('kernel_nonpaged', C.c_size_t),
+                        ('page_size', C.c_size_t), ('handle_count', C.c_uint32),
+                        ('process_count', C.c_uint32), ('thread_count', C.c_uint32)]
+        performance = Performance()
+        performance.cb = C.sizeof(performance)
+        psapi = C.WinDLL('psapi', use_last_error=True)
+        psapi.GetPerformanceInfo.argtypes = [C.POINTER(Performance), C.c_uint32]
+        if psapi.GetPerformanceInfo(C.byref(performance), C.sizeof(performance)):
+            output['performance'] = {name: getattr(performance, name)
+                                     for name, _ in Performance._fields_ if name != 'cb'}
+        return output
+
+    @staticmethod
+    def api_process():
+        kernel = C.WinDLL('kernel32', use_last_error=True)
+        kernel.GetCurrentProcess.restype = C.c_void_p
+        handle = kernel.GetCurrentProcess()
+        output = {'pid': os.getpid(), 'thread_names': [entry.name for entry in threading.enumerate()],
+                  'active_thread_count': threading.active_count()}
+        times = [FileTime() for _ in range(4)]
+        kernel.GetProcessTimes.argtypes = [C.c_void_p] + [C.POINTER(FileTime)] * len(times)
+        if kernel.GetProcessTimes(handle, *(C.byref(value) for value in times)):
+            output['cpu_user_seconds'] = times[3].ticks() / WINDOWS_FILETIME_TICKS_PER_SECOND
+            output['cpu_kernel_seconds'] = times[2].ticks() / WINDOWS_FILETIME_TICKS_PER_SECOND
+            output['creation_time_utc'] = (datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
+                                           + datetime.timedelta(seconds=times[0].ticks() /
+                                                                WINDOWS_FILETIME_TICKS_PER_SECOND)).isoformat()
+        class ProcessMemory(C.Structure):
+            _fields_ = [('cb', C.c_uint32), ('page_fault_count', C.c_uint32),
+                        ('peak_working_set_bytes', C.c_size_t), ('working_set_bytes', C.c_size_t),
+                        ('quota_peak_paged_pool_bytes', C.c_size_t), ('quota_paged_pool_bytes', C.c_size_t),
+                        ('quota_peak_nonpaged_pool_bytes', C.c_size_t), ('quota_nonpaged_pool_bytes', C.c_size_t),
+                        ('pagefile_bytes', C.c_size_t), ('peak_pagefile_bytes', C.c_size_t),
+                        ('private_bytes', C.c_size_t)]
+        usage = ProcessMemory()
+        usage.cb = C.sizeof(usage)
+        psapi = C.WinDLL('psapi', use_last_error=True)
+        psapi.GetProcessMemoryInfo.argtypes = [C.c_void_p, C.POINTER(ProcessMemory), C.c_uint32]
+        if psapi.GetProcessMemoryInfo(handle, C.byref(usage), usage.cb):
+            output['memory'] = {name: getattr(usage, name) for name, _ in ProcessMemory._fields_ if name != 'cb'}
+        class IoCounters(C.Structure):
+            _fields_ = [(name, C.c_uint64) for name in ('read_operations', 'write_operations',
+                         'other_operations', 'read_bytes', 'write_bytes', 'other_bytes')]
+        io = IoCounters()
+        kernel.GetProcessIoCounters.argtypes = [C.c_void_p, C.POINTER(IoCounters)]
+        if kernel.GetProcessIoCounters(handle, C.byref(io)):
+            output['io'] = {name: getattr(io, name) for name, _ in IoCounters._fields_}
+        handles = C.c_uint32()
+        kernel.GetProcessHandleCount.argtypes = [C.c_void_p, C.POINTER(C.c_uint32)]
+        if kernel.GetProcessHandleCount(handle, C.byref(handles)):
+            output['handle_count'] = handles.value
+        return output
+
+    @staticmethod
+    def api_power():
+        class PowerStatus(C.Structure):
+            _fields_ = [('ac_line_status', C.c_uint8), ('battery_flag', C.c_uint8),
+                        ('battery_life_percent', C.c_uint8), ('system_status_flag', C.c_uint8),
+                        ('battery_life_seconds', C.c_uint32), ('battery_full_life_seconds', C.c_uint32)]
+        status = PowerStatus()
+        kernel = C.WinDLL('kernel32', use_last_error=True)
+        kernel.GetSystemPowerStatus.argtypes = [C.POINTER(PowerStatus)]
+        if not kernel.GetSystemPowerStatus(C.byref(status)):
+            raise C.WinError(C.get_last_error())
+        return {name: getattr(status, name) for name, _ in PowerStatus._fields_}
+
+    @staticmethod
+    def api_disks():
+        kernel = C.WinDLL('kernel32', use_last_error=True)
+        kernel.GetLogicalDrives.restype = C.c_uint32
+        kernel.GetDriveTypeW.argtypes = [C.c_wchar_p]
+        kernel.GetDiskFreeSpaceExW.argtypes = [C.c_wchar_p, C.POINTER(C.c_uint64),
+                                               C.POINTER(C.c_uint64), C.POINTER(C.c_uint64)]
+        kernel.GetVolumeInformationW.argtypes = [C.c_wchar_p, C.c_wchar_p, C.c_uint32,
+                                                  C.POINTER(C.c_uint32), C.POINTER(C.c_uint32),
+                                                  C.POINTER(C.c_uint32), C.c_wchar_p, C.c_uint32]
+        active = kernel.GetLogicalDrives()
+        disks = []
+        for index, letter in enumerate('ABCDEFGHIJKLMNOPQRSTUVWXYZ'):
+            if not active & (1 << index):
+                continue
+            root = letter + ':\\'
+            disk = {'root': root, 'drive_type_code': kernel.GetDriveTypeW(root)}
+            free_user = C.c_uint64()
+            total = C.c_uint64()
+            free_total = C.c_uint64()
+            if kernel.GetDiskFreeSpaceExW(root, C.byref(free_user), C.byref(total), C.byref(free_total)):
+                disk.update({'capacity_bytes': total.value, 'free_bytes': free_total.value,
+                             'user_available_bytes': free_user.value})
+            label = C.create_unicode_buffer(WINDOW_TITLE_LIMIT)
+            fs = C.create_unicode_buffer(WINDOW_TITLE_LIMIT)
+            serial = C.c_uint32()
+            component_length = C.c_uint32()
+            flags = C.c_uint32()
+            if kernel.GetVolumeInformationW(root, label, len(label), C.byref(serial),
+                                            C.byref(component_length), C.byref(flags), fs, len(fs)):
+                disk.update({'volume_label': label.value, 'filesystem': fs.value,
+                             'volume_serial': f'{serial.value:08X}',
+                             'max_filename_length': component_length.value,
+                             'filesystem_flags': flags.value})
+            disks.append(disk)
+        return disks
+
+    @staticmethod
+    def api_displays(native=None):
+        user = C.WinDLL('user32', use_last_error=True)
+        class DisplayDevice(C.Structure):
+            _fields_ = [('cb', C.c_uint32), ('name', C.c_wchar * DISPLAY_DEVICE_NAME_CHARS),
+                        ('description', C.c_wchar * DISPLAY_DEVICE_DESCRIPTION_CHARS),
+                        ('flags', C.c_uint32), ('device_id', C.c_wchar * DISPLAY_DEVICE_DESCRIPTION_CHARS),
+                        ('registry_key', C.c_wchar * DISPLAY_DEVICE_DESCRIPTION_CHARS)]
+        user.EnumDisplayDevicesW.argtypes = [C.c_wchar_p, C.c_uint32, C.POINTER(DisplayDevice), C.c_uint32]
+        user.EnumDisplayDevicesW.restype = C.c_int
+        adapters = []
+        index = 0
+        while True:
+            device = DisplayDevice()
+            device.cb = C.sizeof(device)
+            if not user.EnumDisplayDevicesW(None, index, C.byref(device), 0):
+                break
+            output = {'name': device.name, 'description': device.description,
+                      'state_flags': device.flags, 'device_id': device.device_id,
+                      'registry_key': device.registry_key, 'monitors': []}
+            child = 0
+            while True:
+                monitor = DisplayDevice()
+                monitor.cb = C.sizeof(monitor)
+                if not user.EnumDisplayDevicesW(device.name, child, C.byref(monitor), 0):
+                    break
+                output['monitors'].append({'name': monitor.name, 'description': monitor.description,
+                                           'state_flags': monitor.flags, 'device_id': monitor.device_id})
+                child += 1
+            adapters.append(output)
+            index += 1
+        class Rect(C.Structure):
+            _fields_ = [(name, C.c_long) for name in ('left', 'top', 'right', 'bottom')]
+        class MonitorInfo(C.Structure):
+            _fields_ = [('size', C.c_uint32), ('monitor', Rect), ('work', Rect),
+                        ('flags', C.c_uint32), ('device', C.c_wchar * DISPLAY_DEVICE_NAME_CHARS)]
+        monitor_items = []
+        callback_type = C.WINFUNCTYPE(C.c_int, C.c_void_p, C.c_void_p,
+                                      C.POINTER(Rect), C.c_ssize_t)
+        user.GetMonitorInfoW.argtypes = [C.c_void_p, C.POINTER(MonitorInfo)]
+        user.GetMonitorInfoW.restype = C.c_int
+        user.EnumDisplayMonitors.argtypes = [C.c_void_p, C.c_void_p, callback_type, C.c_ssize_t]
+        def monitor_callback(handle, hdc, rect, extra):
+            record = MonitorInfo()
+            record.size = C.sizeof(record)
+            if user.GetMonitorInfoW(handle, C.byref(record)):
+                def coordinates(value):
+                    return [value.left, value.top, value.right, value.bottom]
+                item = {'device': record.device, 'bounds': coordinates(record.monitor),
+                        'working_area': coordinates(record.work), 'flags': record.flags}
+                try:
+                    shcore = C.WinDLL('shcore', use_last_error=True)
+                    shcore.GetDpiForMonitor.argtypes = [C.c_void_p, C.c_uint32,
+                                                       C.POINTER(C.c_uint32), C.POINTER(C.c_uint32)]
+                    dx, dy = C.c_uint32(), C.c_uint32()
+                    if shcore.GetDpiForMonitor(handle, 0, C.byref(dx), C.byref(dy)) == 0:
+                        item['effective_dpi'] = [dx.value, dy.value]
+                except (OSError, AttributeError):
+                    pass
+                monitor_items.append(item)
+            return 1
+        callback = callback_type(monitor_callback)
+        user.EnumDisplayMonitors(None, None, callback, 0)
+        return {'adapters': adapters, 'monitors': monitor_items,
+                'virtual_screen': native.bounds() if native is not None else None}
+
+    @staticmethod
+    def windows_version():
+        import platform
+        class Version(C.Structure):
+            _fields_ = [('size', C.c_uint32), ('major', C.c_uint32), ('minor', C.c_uint32),
+                        ('build', C.c_uint32), ('platform_id', C.c_uint32),
+                        ('service_pack', C.c_wchar * DISPLAY_DEVICE_DESCRIPTION_CHARS),
+                        ('service_pack_major', C.c_uint16), ('service_pack_minor', C.c_uint16),
+                        ('suite_mask', C.c_uint16), ('product_type', C.c_uint8),
+                        ('reserved', C.c_uint8)]
+        version = Version()
+        version.size = C.sizeof(version)
+        ntdll = C.WinDLL('ntdll', use_last_error=True)
+        ntdll.RtlGetVersion.argtypes = [C.POINTER(Version)]
+        result = {'platform': platform.platform(), 'win32_version': platform.win32_ver(),
+                  'windows_version_python': tuple(sys.getwindowsversion())}
+        if ntdll.RtlGetVersion(C.byref(version)) == 0:
+            result.update({'major': version.major, 'minor': version.minor,
+                           'build': version.build, 'platform_id': version.platform_id,
+                           'service_pack': version.service_pack,
+                           'suite_mask': version.suite_mask, 'product_type': version.product_type})
+        kernel = C.WinDLL('kernel32', use_last_error=True)
+        kernel.GetTickCount64.restype = C.c_uint64
+        result['system_uptime_seconds'] = kernel.GetTickCount64() / MILLISECONDS_PER_SECOND
+        return result
+
+    @staticmethod
+    def python_runtime():
+        import importlib.metadata
+        import locale
+        import platform
+        import sysconfig
+        output = {
+            'version': sys.version, 'version_info': list(sys.version_info),
+            'implementation': platform.python_implementation(), 'compiler': platform.python_compiler(),
+            'architecture': platform.architecture(), 'executable': sys.executable,
+            'base_prefix': sys.base_prefix, 'prefix': sys.prefix,
+            'python_abi': python_abi(), 'python_platform': sysconfig.get_platform(),
+            'filesystem_encoding': sys.getfilesystemencoding(),
+            'default_encoding': sys.getdefaultencoding(), 'locale': locale.getlocale(),
+            'timezone': list(time.tzname),
+            'utc_offset_seconds': datetime.datetime.now().astimezone().utcoffset().total_seconds(),
+            'cpu_count_logical': os.cpu_count(),
+            'sys_path': sys.path[:],
+            'optional_accelerator_loaded': NUMPY_ACCELERATOR is not None,
+            'tkinter_loaded': 'tkinter' in sys.modules,
+            'loaded_module_count': len(sys.modules),
+        }
+        output['installed_python_packages'] = sorted(({'name': package.metadata.get('Name', ''),
+                                                         'version': package.version}
+                                                        for package in importlib.metadata.distributions()),
+                                                       key=lambda item: str(item['name'] or '').casefold())
+        return output
+
+    @classmethod
+    def cim(cls, names, timeout):
+        system_root = Path(os.environ.get('SystemRoot', r'C:\Windows'))
+        powershell = system_root / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'
+        if not powershell.is_file():
+            raise OSError('Windows PowerShell 不可用，已保留 Windows API 与注册表采集结果')
+        statements = ["$ErrorActionPreference = 'Stop'",
+                      "$ProgressPreference = 'SilentlyContinue'",
+                      '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+                      '$result = [ordered]@{}', '$failures = [ordered]@{}']
+        for name, fields in names.items():
+            if not re.fullmatch(r'Win32_[A-Za-z0-9]+', name) or not all(
+                    re.fullmatch(r'[A-Za-z0-9]+', field) for field in fields):
+                raise ValueError('设备查询字段无效')
+            properties = ','.join(fields)
+            statements.append("try { $result['" + name + "'] = @(Get-CimInstance -ClassName "
+                              + name + ' -ErrorAction Stop | Select-Object -Property '
+                              + properties + ") } catch { $failures['" + name
+                              + "'] = $_.Exception.Message }")
+        statements.append('[PSCustomObject]@{devices=$result;errors=$failures} | ConvertTo-Json -Depth 6 -Compress')
+        completed = subprocess.run([str(powershell), '-NoProfile', '-NonInteractive',
+                                    '-Command', ';'.join(statements)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   stdin=subprocess.DEVNULL, timeout=timeout,
+                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                                   check=False)
+        if completed.returncode:
+            raise OSError('CIM 查询失败：' + completed.stderr.decode('utf-8', 'replace')[:WINDOW_TITLE_LIMIT])
+        if len(completed.stdout) > BLACKBOX_PROBE_MAX_BYTES:
+            raise OSError('CIM 结果超过允许大小')
+        data = json.loads(completed.stdout.decode('utf-8-sig', 'replace').strip())
+        if not isinstance(data, dict) or not isinstance(data.get('devices'), dict):
+            raise ValueError('CIM 数据格式无效')
+        return data
+
+    @classmethod
+    def collect(cls, folder, native=None, progress=None):
+        report = {'collected_utc': utc_stamp(), 'folder': str(folder),
+                  'device_information_warning': '包含硬件序列号、设备标识符、网络地址、安装路径等个人设备信息；请在分享黑匣子前审查内容。',
+                  'sources': {}, 'collection_errors': {}}
+        sources = (
+            ('windows_version', cls.windows_version),
+            ('registry', cls.registry),
+            ('python_runtime', cls.python_runtime),
+            ('system_memory', cls.api_memory),
+            ('sampled_system_load', lambda: dict(zip(('cpu_utilization_fraction', 'available_ram_bytes', 'total_ram_bytes'), native.hardware_state())) if native is not None else None),
+            ('agent_process', cls.api_process),
+            ('power_status', cls.api_power),
+            ('logical_drives', cls.api_disks),
+            ('display_devices', lambda: cls.api_displays(native)),
+            ('disk_space_for_agent_folder', lambda: dict(zip(('total_bytes', 'used_bytes', 'free_bytes'), shutil.disk_usage(folder)))),
+        )
+        for key, probe in sources:
+            try:
+                report['sources'][key] = probe()
+            except Exception as error:
+                report['collection_errors'][key] = type(error).__name__ + ': ' + str(error)
+        for key, specifications in (('cim_hardware', cls.CIM_GROUPS),
+                                    ('cim_drivers_and_pnp_devices', cls.CIM_DRIVERS)):
+            if progress is not None:
+                progress('正在采集设备信息 · ' + key, None)
+            try:
+                report['sources'][key] = cls.cim(specifications, BLACKBOX_PROBE_TIMEOUT_SECONDS)
+            except Exception as error:
+                report['collection_errors'][key] = type(error).__name__ + ': ' + str(error)
+        report['finished_utc'] = utc_stamp()
+        report['successful_sections'] = len(report['sources'])
+        report['failed_sections'] = len(report['collection_errors'])
+        return report
+
+
+
 class VideoFeatures:
     __slots__ = ("signature", "frames", "duration", "motion", "trend", "cadence")
 
@@ -4954,10 +6182,82 @@ class VideoBudget:
         self.samples = 0
         self.last_hardware = 0.0
         self.last_growth = 0.0
+        self.no_effect_ema = None
+        self.goal_progress_rate_ema = None
+        self.verified_feedbacks = 0
+        self.action_edge = None
+        self.cycle_samples = collections.deque(maxlen=TEMPORAL_MAX_FRAMES)
+        self.feedback_attempts = 0
+        self.feedback_valid = 0
+        self.no_effect_observations = 0
+        self.effect_observations = 0
+        self.resolution_trial = None
+        self.resolution_failures = 0
+        self.recognition = None
+        self.recognition_components = {}
+        self.resolution_unassessed = 0
 
     def profile(self):
         with self.lock:
-            return self.edge, self.frames, self.interval, self.cpu, self.free_memory
+            return (self.action_edge if self.action_edge is not None else self.edge,
+                    self.frames, self.interval, self.cpu, self.free_memory)
+
+    def begin_action(self, frame):
+        with self.lock:
+            self.action_edge = max(frame.width, frame.height)
+
+    def end_action(self):
+        with self.lock:
+            self.action_edge = None
+        self.adapt()
+
+    def record_cycle(self, seconds, valid, effect=None, recognition=None, edge=None):
+        with self.lock:
+            self.feedback_attempts += 1
+            self.feedback_valid += int(valid)
+            if seconds > 0.0 and math.isfinite(seconds):
+                self.cycle_samples.append(seconds)
+            if isinstance(recognition, dict):
+                components = {key: value for key, value in recognition.items()
+                              if isinstance(value, (float, int)) and math.isfinite(value)}
+                quality = (sum(components.values()) / len(components)) if components else None
+            else:
+                components = {}
+                quality = (float(recognition) if isinstance(recognition, (float, int))
+                           and math.isfinite(recognition) else None)
+            if valid:
+                self.recognition = quality
+                self.recognition_components = components
+                if effect is not None:
+                    self.effect_observations += 1
+                    self.no_effect_observations += int(effect < VISUAL_EFFECT_THRESHOLD)
+            trial = self.resolution_trial
+            if not valid or trial is None or edge != trial['edge']:
+                return
+            trial['attempts'] = trial.get('attempts', 0) + 1
+            baseline = trial['baseline_quality']
+            if quality is None or baseline is None:
+                self.resolution_unassessed += 1
+                self.resolution_trial = None
+                self.last_growth = time.monotonic()
+                return
+            trial['samples'] += 1
+            trial['recognition'] += quality
+            trial['seconds'] += max(0.0, seconds)
+            required = math.ceil(math.sqrt(self.effect_observations + 1))
+            if trial['samples'] < required:
+                return
+            quality = trial['recognition'] / trial['samples']
+            cost = trial['seconds'] / trial['samples']
+            previous_efficiency = baseline / max(trial['baseline_cost'], sys.float_info.epsilon)
+            efficiency = quality / max(cost, sys.float_info.epsilon)
+            if quality < baseline or (quality == baseline and efficiency < previous_efficiency):
+                self.edge = min(self.edge, trial['previous_edge'])
+                self.resolution_failures += 1
+            else:
+                self.resolution_failures = 0
+            self.resolution_trial = None
+            self.last_growth = time.monotonic()
 
     def record_capture(self, seconds):
         with self.lock:
@@ -4968,7 +6268,8 @@ class VideoBudget:
             self.capture_samples += 1
         self.adapt()
 
-    def record_reasoning(self, seconds, feedback_latency=None, motion=None):
+    def record_reasoning(self, seconds, feedback_latency=None, motion=None,
+                         goal_signal=None, effect=None):
         with self.lock:
             old = self.reasoning_ema
             self.reasoning_ema = seconds if old is None else (
@@ -4984,6 +6285,22 @@ class VideoBudget:
                 self.motion_ema = motion if old is None else (
                     old * (1.0 - TEMPORAL_CAPTURE_EMA_WEIGHT)
                     + motion * TEMPORAL_CAPTURE_EMA_WEIGHT)
+            if effect is not None and math.isfinite(effect):
+                no_effect = float(effect < VISUAL_EFFECT_THRESHOLD and
+                                  (goal_signal is None or goal_signal <= 0.0))
+                old = self.no_effect_ema
+                self.no_effect_ema = no_effect if old is None else (
+                    old * (1.0 - TEMPORAL_COMPUTE_EMA_WEIGHT)
+                    + no_effect * TEMPORAL_COMPUTE_EMA_WEIGHT)
+            if goal_signal is not None and math.isfinite(goal_signal):
+                observed_rate = (goal_signal * SECONDS_PER_MINUTE /
+                                 max(TEMPORAL_MIN_INTERVAL_SECONDS,
+                                     feedback_latency or seconds))
+                old = self.goal_progress_rate_ema
+                self.goal_progress_rate_ema = observed_rate if old is None else (
+                    old * (1.0 - TEMPORAL_COMPUTE_EMA_WEIGHT)
+                    + observed_rate * TEMPORAL_COMPUTE_EMA_WEIGHT)
+                self.verified_feedbacks += 1
         self.adapt()
 
     def telemetry(self):
@@ -4991,12 +6308,51 @@ class VideoBudget:
             return {"capture_rate_hz": self.capture_rate,
                     "decision_rate_hz": self.decision_rate,
                     "feedback_latency_ema": self.feedback_ema,
-                    "observed_compute_load": self.workload}
+                    "observed_compute_load": self.workload,
+                    "capture_compute_seconds_ema": self.capture_ema,
+                    "decision_compute_seconds_ema": self.reasoning_ema,
+                    "motion_ema": self.motion_ema,
+                    "physical_cpu_utilization_fraction": self.cpu,
+                    "available_physical_memory_bytes": self.free_memory,
+                    "total_physical_memory_bytes": self.total_memory,
+                    "no_effect_ema": self.no_effect_ema,
+                    "verified_progress_per_minute_ema": self.goal_progress_rate_ema,
+                    "verified_feedback_samples": self.verified_feedbacks,
+                    "feedback_attempts": self.feedback_attempts,
+                    "feedback_valid_ratio": (self.feedback_valid / self.feedback_attempts
+                                             if self.feedback_attempts else None),
+                    "cycle_seconds_mean": (sum(self.cycle_samples) / len(self.cycle_samples)
+                                           if self.cycle_samples else None),
+                    "resolution_trial": dict(self.resolution_trial) if self.resolution_trial else None,
+                    "resolution_failed_trials": self.resolution_failures,
+                    "resolution_unassessed_trials": self.resolution_unassessed,
+                    "recognition_quality": self.recognition,
+                    "recognition_components": dict(self.recognition_components)}
 
     def scene_fast(self):
         with self.lock:
             return (self.motion_ema is not None and
                     self.motion_ema >= FAST_FEEDBACK_MOTION_THRESHOLD)
+
+    def planning_budget(self, stagnation=0):
+        with self.lock:
+            pressure = (self.workload >= TEMPORAL_COMPUTE_INTERVAL_SHARE or
+                        self.cpu is not None and self.cpu >= TEMPORAL_CPU_PRESSURE_THRESHOLD or
+                        self.free_memory is not None and self.total_memory and
+                        self.free_memory / self.total_memory < TEMPORAL_MEMORY_RESERVE_RATIO)
+            moving = (self.motion_ema is not None and
+                      self.motion_ema >= FAST_FEEDBACK_MOTION_THRESHOLD)
+            available = max(TEMPORAL_INITIAL_COMPUTE_SECONDS,
+                            self.interval * TEMPORAL_COMPUTE_INTERVAL_SHARE)
+            if pressure:
+                available *= VISION_PRESSURE_SAMPLING_RATIO
+            elif moving:
+                available *= TEMPORAL_INTERVAL_FAST_FACTOR
+            else:
+                available *= (1.0 + VISION_STABLE_SAMPLING_RATIO * min(
+                    1.0, max(0, stagnation) / GOAL_STAGNATION_STEPS))
+            return max(TEMPORAL_MIN_INTERVAL_SECONDS * TEMPORAL_COMPUTE_INTERVAL_SHARE,
+                       min(TEMPORAL_MAX_INTERVAL_SECONDS, available))
 
     def region_budget(self, category):
         with self.lock:
@@ -5031,6 +6387,7 @@ class VideoBudget:
     def reduce_on_memory(self):
         with self.lock:
             self.edge = max(VISION_ADAPTIVE_MIN_EDGE, self.edge // 2)
+            self.resolution_trial = None
             self.frames = max(TEMPORAL_MIN_FRAMES, self.frames // 2)
             self.interval = min(TEMPORAL_MAX_INTERVAL_SECONDS,
                                 self.interval * TEMPORAL_INTERVAL_SLOW_FACTOR)
@@ -5038,7 +6395,8 @@ class VideoBudget:
     def adapt(self):
         now = time.monotonic()
         with self.lock:
-            if self.samples < VISION_ADAPT_EVERY_STEPS or now - self.last_hardware < TEMPORAL_RESOURCE_REFRESH_SECONDS:
+            if (self.action_edge is not None or self.samples < VISION_ADAPT_EVERY_STEPS
+                    or now - self.last_hardware < TEMPORAL_RESOURCE_REFRESH_SECONDS):
                 return
             self.samples = 0
             duration = max(TEMPORAL_HARDWARE_SAMPLE_MIN_SECONDS,
@@ -5053,6 +6411,12 @@ class VideoBudget:
             self.cpu = cpu
             self.free_memory = free
             self.total_memory = total
+            desktop = self.native.bounds()
+            display_edge = max(desktop[2:])
+            memory_edge = (math.isqrt(max(1, int(free * TEMPORAL_MEMORY_VIDEO_RATIO /
+                           max(1, self.frames * (BYTES_PER_RGB_PIXEL + 1))))) if free else display_edge)
+            maximum_edge = max(VISION_ADAPTIVE_MIN_EDGE, min(display_edge, memory_edge))
+            self.edge = min(self.edge, maximum_edge)
             self.capture_rate = captures / duration
             self.decision_rate = decisions / duration
             self.workload = ((self.capture_ema or TEMPORAL_INITIAL_COMPUTE_SECONDS)
@@ -5063,10 +6427,11 @@ class VideoBudget:
                              and self.motion_ema >= FAST_FEEDBACK_MOTION_THRESHOLD)
             cpu_busy = cpu is not None and cpu >= TEMPORAL_CPU_PRESSURE_THRESHOLD
             memory_low = free is not None and total and free / total < TEMPORAL_MEMORY_RESERVE_RATIO
-            latency_high = (motion_active and self.feedback_ema is not None
-                            and self.feedback_ema > max(
-                                TEMPORAL_MAX_INTERVAL_SECONDS,
-                                self.interval * TEMPORAL_AFTER_MAX_EVALUATIONS))
+            ordered_cycles = sorted(self.cycle_samples)
+            cycle_reference = (ordered_cycles[len(ordered_cycles) // 2]
+                               if ordered_cycles else TEMPORAL_MAX_INTERVAL_SECONDS)
+            latency_high = (self.feedback_ema is not None and self.feedback_ema > max(
+                cycle_reference, self.interval * TEMPORAL_AFTER_MAX_EVALUATIONS))
             pressure = (self.workload > TEMPORAL_COMPUTE_INTERVAL_SHARE
                         or cpu_busy or memory_low or latency_high)
             spare = (self.workload < TEMPORAL_LOW_COST_RATIO
@@ -5074,20 +6439,40 @@ class VideoBudget:
                      and (free is None or total and free / total >= TEMPORAL_MEMORY_RESERVE_RATIO))
             if pressure:
                 self.edge = max(VISION_ADAPTIVE_MIN_EDGE, self.edge - VISION_RESOLUTION_STEP)
+                self.resolution_trial = None
                 self.frames = max(TEMPORAL_MIN_FRAMES, self.frames - TEMPORAL_FRAME_CHANGE)
-                if motion_active and not (cpu_busy or memory_low):
-                    self.interval = max(TEMPORAL_MIN_INTERVAL_SECONDS,
-                                        self.interval * TEMPORAL_INTERVAL_FAST_FACTOR)
-                elif not motion_active or cpu_busy or memory_low:
-                    self.interval = min(TEMPORAL_MAX_INTERVAL_SECONDS,
-                                        self.interval * TEMPORAL_INTERVAL_SLOW_FACTOR)
-            elif spare and now - self.last_growth >= TEMPORAL_GROWTH_COOLDOWN_SECONDS:
-                if motion_active:
+                if motion_active and latency_high and not (
+                        cpu_busy or memory_low or
+                        self.workload > TEMPORAL_COMPUTE_INTERVAL_SHARE):
                     self.interval = max(TEMPORAL_MIN_INTERVAL_SECONDS,
                                         self.interval * TEMPORAL_INTERVAL_FAST_FACTOR)
                 else:
-                    self.edge = min(VISION_ADAPTIVE_MAX_EDGE, self.edge + VISION_RESOLUTION_STEP)
+                    self.interval = min(TEMPORAL_MAX_INTERVAL_SECONDS,
+                                        self.interval * TEMPORAL_INTERVAL_SLOW_FACTOR)
+            elif (spare and self.resolution_trial is None and
+                  now - self.last_growth >= max(TEMPORAL_GROWTH_COOLDOWN_SECONDS, cycle_reference)
+                  * (1 + self.resolution_failures)):
+                failures = self.no_effect_observations
+                successes = self.effect_observations - failures
+                uncertainty = math.sqrt(self.effect_observations + 1)
+                poor_effect = failures > successes + uncertainty
+                poor_progress = (self.verified_feedbacks >= VISION_ADAPT_EVERY_STEPS and
+                                 self.goal_progress_rate_ema is not None and
+                                 self.goal_progress_rate_ema <= GOAL_NEGATIVE_PROGRESS_TOLERANCE)
+                previous_edge = self.edge
+                if motion_active or (not poor_effect and not poor_progress):
+                    self.interval = max(TEMPORAL_MIN_INTERVAL_SECONDS,
+                                        self.interval * TEMPORAL_INTERVAL_FAST_FACTOR)
+                    if motion_active and poor_effect:
+                        self.edge = min(maximum_edge, self.edge + VISION_RESOLUTION_STEP)
+                else:
+                    self.edge = min(maximum_edge, self.edge + VISION_RESOLUTION_STEP)
                     self.frames = min(TEMPORAL_MAX_FRAMES, self.frames + TEMPORAL_FRAME_CHANGE)
+                if self.edge > previous_edge:
+                    self.resolution_trial = {'previous_edge': previous_edge, 'edge': self.edge,
+                                             'baseline_quality': self.recognition,
+                                             'baseline_cost': cycle_reference,
+                                             'samples': 0, 'recognition': 0.0, 'seconds': 0.0}
                 self.last_growth = now
             max_by_time = max(TEMPORAL_MIN_FRAMES, int(TEMPORAL_MAX_WINDOW_SECONDS / self.interval))
             self.frames = min(self.frames, max_by_time, TEMPORAL_MAX_FRAMES)
@@ -5105,6 +6490,11 @@ class AdaptiveVideoStream:
         self.condition = threading.Condition()
         self.area = None
         self.window = None
+        self.target_identity = None
+        self.target_generation = 0
+        self.action_shape = None
+        self.action_details = None
+        self.detail_cursor = 0
         self.samples = collections.deque(maxlen=TEMPORAL_MAX_FRAMES)
         self.error = ""
         self.failure = None
@@ -5112,23 +6502,50 @@ class AdaptiveVideoStream:
         self.thread = threading.Thread(target=self.run, name="adaptive-video-stream", daemon=True)
         self.thread.start()
 
-    def target(self, area, window=None):
+    def target(self, area, window=None, identity=None):
         with self.condition:
-            if area != self.area or window != self.window:
+            if (area != self.area or window != self.window
+                    or identity != self.target_identity):
                 self.area = area
                 self.window = window
+                self.target_identity = identity
+                self.target_generation += 1
                 self.samples.clear()
                 self.error = ""
                 self.failure = None
                 self.condition.notify_all()
 
-    def wait_frame(self, newer_than=None):
+    def begin_action(self, frame):
+        with self.condition:
+            if (frame.generation != self.target_generation or frame.bounds != self.area
+                    or frame.target_identity != self.target_identity):
+                raise TargetChanged({'reason': 'capture_generation_changed',
+                                     'expected_generation': frame.generation,
+                                     'actual_generation': self.target_generation,
+                                     'expected_bounds': frame.bounds, 'actual_bounds': self.area,
+                                     'expected_identity': frame.target_identity,
+                                     'actual_identity': self.target_identity})
+            self.action_shape = (frame.width, frame.height)
+            self.action_details = tuple(detail.bounds for detail in frame.details)
+            self.budget.begin_action(frame)
+            self.samples = collections.deque(
+                ((stamp, image) for stamp, image in self.samples
+                 if (image.width, image.height) == self.action_shape), maxlen=TEMPORAL_MAX_FRAMES)
+
+    def end_action(self):
+        with self.condition:
+            self.action_shape = None
+            self.action_details = None
+        self.budget.end_action()
+
+    def wait_frame(self, newer_than=None, captured_after=None):
         deadline = time.monotonic() + max(
             VIDEO_FRAME_WAIT_TIMEOUT_SECONDS, self.budget.profile()[2] * TEMPORAL_AFTER_MAX_EVALUATIONS)
         with self.condition:
             while not self.stop.is_set() and not self.closed.is_set():
                 now = time.monotonic()
                 available = (self.samples and (newer_than is None or self.samples[-1][0] > newer_than)
+                             and (captured_after is None or self.samples[-1][1].capture_started >= captured_after)
                              and now - self.samples[-1][0] <= TEMPORAL_MIN_CAPTURE_AGE_SECONDS)
                 if available:
                     return self.samples[-1], list(self.samples)[-self.budget.profile()[1]:]
@@ -5146,6 +6563,38 @@ class AdaptiveVideoStream:
                 self.condition.wait(timeout=min(KEYBOARD_POLL_SECONDS, deadline - now))
         return None, []
 
+    def capture_details(self, frame, window):
+        left, top, width, height = frame.bounds
+        if max(width, height) <= max(frame.width, frame.height):
+            return ()
+        with self.condition:
+            areas = self.action_details
+            if areas is None:
+                columns = max(1, math.ceil(width / VISION_LONG_EDGE))
+                rows = max(1, math.ceil(height / VISION_LONG_EDGE))
+                index = self.detail_cursor % (columns * rows)
+                self.detail_cursor += 1
+                row, column = divmod(index, columns)
+                x0, x1 = width * column // columns, width * (column + 1) // columns
+                y0, y1 = height * row // rows, height * (row + 1) // rows
+                overlap = max(OBJECTIVE_FONT_HEIGHTS)
+                x0, y0 = max(0, x0 - overlap), max(0, y0 - overlap)
+                x1, y1 = min(width, x1 + overlap), min(height, y1 + overlap)
+                areas = ((left + x0, top + y0, x1 - x0, y1 - y0),)
+        details = []
+        for area in areas:
+            if self.stop.is_set() or self.closed.is_set():
+                break
+            x, y, w, h = area
+            if not (left <= x < x+w <= left+width and top <= y < y+h <= top+height):
+                continue
+            try:
+                detail = self.native.capture(area, max(w, h), window=window)
+                details.append(detail)
+            except (OSError, MemoryError):
+                continue
+        return tuple(details)
+
     def peek_frame(self):
         with self.condition:
             return self.samples[-1] if self.samples else None
@@ -5158,19 +6607,42 @@ class AdaptiveVideoStream:
         while not self.stop.is_set() and not self.closed.is_set():
             with self.condition:
                 area, window = self.area, self.window
+                identity = self.target_identity
+                generation = self.target_generation
             if area is None or window is not None and not self.native.target_is_foreground(window):
                 self.stop.wait(TEMPORAL_MAX_INTERVAL_SECONDS)
                 continue
             edge, frames, interval, _, _ = self.budget.profile()
             started = time.monotonic()
             try:
-                image = self.native.capture(area, edge)
+                origin_identity = self.native.foreground_identity()
+                image = self.native.capture(area, edge, window=window)
+                image.details = self.capture_details(image, window)
                 finished = time.monotonic()
+                final_identity = self.native.foreground_identity()
+                if origin_identity != final_identity or (identity is not None and identity != final_identity):
+                    self.stop.wait(max(TEMPORAL_MIN_INTERVAL_SECONDS, interval - (finished - started)))
+                    continue
+                image.capture_started = started
+                image.captured_at = finished
+                image.target_identity = final_identity
+                image.generation = generation
+                root = (self.native.user.GetAncestor(final_identity[0], GA_ROOTOWNER)
+                        if final_identity and final_identity[0] else None)
+                image.cache['root_window'] = root
+                image.cache['root_owner'] = self.native.window_owner(root) if root else None
+                for detail in image.details:
+                    detail.capture_started = started
+                    detail.captured_at = finished
+                    detail.target_identity = final_identity
+                    detail.generation = generation
                 with self.condition:
                     self.error = ""
                     self.failure = None
-                    if (self.area == area and self.window == window and
-                            (window is None or self.native.target_is_foreground(window))):
+                    if (self.target_generation == generation and
+                            self.area == area and self.window == window and
+                            (window is None or self.native.target_is_foreground(window)) and
+                            (self.action_shape is None or self.action_shape == (image.width, image.height))):
                         if self.samples and (self.samples[-1][1].width, self.samples[-1][1].height) != (image.width, image.height):
                             self.samples.clear()
                         self.samples.append((finished, image))
@@ -5197,7 +6669,8 @@ class AdaptiveVideoStream:
 
 
 class Frame:
-    __slots__ = ("width", "height", "gray", "rgb", "bounds", "cache")
+    __slots__ = ("width", "height", "gray", "rgb", "bounds", "cache",
+                 "frame_id", "captured_at", "capture_started", "target_identity", "generation", "details")
 
     def __init__(self, width, height, gray, rgb, bounds=None):
         self.width = width
@@ -5206,6 +6679,12 @@ class Frame:
         self.rgb = rgb
         self.bounds = bounds if bounds is not None else (0, 0, width, height)
         self.cache = {}
+        self.frame_id = uuid.uuid4().hex
+        self.captured_at = time.monotonic()
+        self.capture_started = self.captured_at
+        self.target_identity = None
+        self.generation = None
+        self.details = ()
 
     def ppm(self):
         return f"P6\n{self.width} {self.height}\n{COLOR_MAX}\n".encode("ascii") + self.rgb
@@ -5387,15 +6866,20 @@ class OnlineCausalNetwork:
     INPUT_FEATURES = (VISUAL_CONCEPT_GRID_SIDE ** 2 + OBJECT_PATCH_APPEARANCE_HUE_LEVELS
                       + len(VISUAL_CONCEPT_ROLE_LABELS) + 1)
     GOAL_FEATURES = len(GOAL_CATEGORY_PRIORITIES) + 1
-    INPUT_SIZE = INPUT_FEATURES + NEURAL_MAX_CANDIDATE_ACTIONS + GOAL_FEATURES + 4
-    LAYERS = (INPUT_SIZE, *NEURAL_HIDDEN_LAYERS, NEURAL_OUTPUT_COUNT)
+    INPUT_SIZE = (INPUT_FEATURES + NEURAL_MAX_CANDIDATE_ACTIONS
+                  + NEURAL_KEYBOARD_FEATURES + NEURAL_CONTROL_FEATURES + 1
+                  + GOAL_FEATURES + 4)
+    LAYERS = (INPUT_SIZE, math.ceil(math.sqrt(INPUT_SIZE * NEURAL_OUTPUT_COUNT)), NEURAL_OUTPUT_COUNT)
 
     def __init__(self, store, name, template=None):
         self.store = store
         self.name = name
-        self.rng = random.Random()
+        self.rng = store.random_stream(type(self).__name__) if store is not None else random.Random(STATE_ENCODING_VERSION)
         self.updates = 0
         self.goal_samples = 0
+        self.goal_error_total = 0.0
+        self.effect_error_total = 0.0
+        self.effect_samples = 0
         self.weights = []
         self.biases = []
         for n_in, n_out in zip(self.LAYERS, self.LAYERS[1:]):
@@ -5403,6 +6887,11 @@ class OnlineCausalNetwork:
             self.weights.append([[self.rng.uniform(-bound, bound) for _ in range(n_in)]
                                  for _ in range(n_out)])
             self.biases.append([0.0] * n_out)
+        if store is not None:
+            with store.lock, store.db:
+                store.db.execute("INSERT OR IGNORE INTO neural_baselines VALUES(?,?,?)",
+                    (name, json.dumps({'weights': self.weights, 'biases': self.biases},
+                                     separators=(',', ':'), allow_nan=False), utc_stamp()))
         if template is not None:
             self.weights = [[row[:] for row in layer] for layer in template.weights]
             self.biases = [layer[:] for layer in template.biases]
@@ -5412,22 +6901,37 @@ class OnlineCausalNetwork:
                 if saved is not None:
                     encoded, updates, goal_samples = saved
                     if len(encoded.encode('utf-8')) <= NEURAL_MAX_ACCEPTED_STATE_BYTES:
-                        weights, biases = json.loads(encoded)
+                        decoded = json.loads(encoded)
+                        current = isinstance(decoded, dict) and decoded.get('goal_supervision') == 'verified_only'
+                        weights, biases = ((decoded['weights'], decoded['biases']) if current else decoded)
                         if self.valid(weights, biases):
                             self.weights = weights
                             self.biases = biases
                             self.updates = max(0, updates)
-                            self.goal_samples = max(0, goal_samples)
-            except (sqlite3.Error, ValueError, TypeError) as error:
+                            if current:
+                                self.goal_samples = max(0, goal_samples)
+                                for field in ('goal_error_total', 'effect_error_total', 'effect_samples'):
+                                    value = decoded.get(field, 0)
+                                    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                                        setattr(self, field, value)
+                            else:
+                                self.weights[-1][0] = [0.0] * len(self.weights[-1][0])
+                                self.biases[-1][0] = 0.0
+            except (sqlite3.Error, ValueError, TypeError, KeyError) as error:
                 store.last_error = str(error)
 
     @classmethod
     def valid(cls, weights, biases):
         if not isinstance(weights, list) or not isinstance(biases, list):
             return False
-        if len(weights) != len(cls.LAYERS) - 1 or len(biases) != len(weights):
+        if not weights or len(biases) != len(weights):
             return False
-        for layer, (n_in, n_out) in enumerate(zip(cls.LAYERS, cls.LAYERS[1:])):
+        if not all(isinstance(layer, list) and layer for layer in biases):
+            return False
+        dimensions = (cls.INPUT_SIZE, *(len(layer) for layer in biases))
+        if dimensions[-1] != NEURAL_OUTPUT_COUNT:
+            return False
+        for layer, (n_in, n_out) in enumerate(zip(dimensions, dimensions[1:])):
             if not isinstance(weights[layer], list) or len(weights[layer]) != n_out:
                 return False
             if not isinstance(biases[layer], list) or len(biases[layer]) != n_out:
@@ -5444,13 +6948,33 @@ class OnlineCausalNetwork:
 
     @classmethod
     def inputs(cls, features, action, goal, velocity_x=0.0, velocity_y=0.0,
-               delta_x=0.0, delta_y=0.0):
-        if len(features) != cls.INPUT_FEATURES or action not in MOUSE_ACTIONS:
+               delta_x=0.0, delta_y=0.0, keys=(), duration=None):
+        if (len(features) != cls.INPUT_FEATURES or
+                action not in (*MOUSE_ACTIONS, KEYBOARD_ACTION_NAME)):
+            return None
+        keys = tuple(dict.fromkeys(keys))
+        if (action == KEYBOARD_ACTION_NAME and not keys or
+                any(not isinstance(key, int) or not 1 <= key <= VK_LAST for key in keys)):
             return None
         values = [max(-NEURAL_MAX_INPUT_FEATURE, min(NEURAL_MAX_INPUT_FEATURE, float(x)))
                   for x in features]
         values.extend(float(action == candidate)
-                      for candidate in MOUSE_ACTIONS[:NEURAL_MAX_CANDIDATE_ACTIONS])
+                      for candidate in (*MOUSE_ACTIONS, KEYBOARD_ACTION_NAME))
+        keyboard_vector = [0.0] * NEURAL_KEYBOARD_FEATURES
+        groups = NEURAL_KEYBOARD_FEATURES // 2
+        for key in keys:
+            keyboard_vector[key % groups] = 1.0
+            keyboard_vector[groups + (key // groups) % groups] = 1.0
+        values.extend(keyboard_vector)
+        mode = ('keyboard' if action == KEYBOARD_ACTION_NAME else
+                'joint' if keys else 'mouse')
+        values.extend(float(mode == candidate) for candidate in CONTROL_MODES)
+        if duration is not None and isinstance(duration, (int, float)) and math.isfinite(duration):
+            timing = (math.log1p(max(KEYBOARD_MIN_DURATION, min(KEYBOARD_MAX_DURATION, duration)))
+                      / math.log1p(KEYBOARD_MAX_DURATION))
+        else:
+            timing = 0.0
+        values.append(timing)
         goals = tuple(GOAL_CATEGORY_PRIORITIES)
         values.extend(float(goal == candidate)
                       for candidate in goals)
@@ -5473,7 +6997,7 @@ class OnlineCausalNetwork:
     def predict(self, features):
         return self.forward(features)[-1]
 
-    def learn(self, features, target_reward, target_effect, has_goal):
+    def learn(self, features, target_reward, target_effect, has_goal, count_example=True):
         if len(features) != self.INPUT_SIZE:
             return
         if not all(math.isfinite(float(value)) for value in features):
@@ -5486,8 +7010,14 @@ class OnlineCausalNetwork:
         layer_count = len(self.weights)
         updates = self.updates
         rate = NEURAL_LEARNING_RATE / math.sqrt(1.0 + updates * NEURAL_LEARNING_DECAY)
+        if count_example:
+            self.effect_error_total += abs(activations[-1][1] - target_effect)
+            self.effect_samples += 1
+            if has_goal:
+                self.goal_error_total += abs(activations[-1][0] - target_reward)
         downstream = [(prediction - target) * (1.0 - prediction * prediction)
-                      for prediction, target in zip(activations[-1], targets)]
+                      if index != 0 or has_goal else 0.0
+                      for index, (prediction, target) in enumerate(zip(activations[-1], targets))]
         for layer in range(layer_count - 1, -1, -1):
             previous = activations[layer]
             weights = self.weights[layer]
@@ -5496,6 +7026,8 @@ class OnlineCausalNetwork:
                                * (1.0 - previous[column] * previous[column])
                                for column in range(len(previous))] if layer else None
             for index, delta in enumerate(downstream):
+                if layer == layer_count - 1 and index == 0 and not has_goal:
+                    continue
                 delta = max(-NEURAL_GRADIENT_CLIP, min(NEURAL_GRADIENT_CLIP, delta))
                 for column, activation in enumerate(previous):
                     value = weights[index][column]
@@ -5504,96 +7036,281 @@ class OnlineCausalNetwork:
                 self.biases[layer][index] -= rate * delta
             downstream = next_downstream
         self.updates += 1
-        self.goal_samples += int(has_goal)
-        if self.updates % NEURAL_PERSIST_INTERVAL == 0 and self.store is not None:
-            self.persist()
+        self.goal_samples += int(has_goal and count_example)
+
+    def snapshot(self):
+        result = copy.copy(self)
+        result.weights = [[row[:] for row in layer] for layer in self.weights]
+        result.biases = [layer[:] for layer in self.biases]
+        result.store = None
+        return result
 
     def persist(self):
         if self.store is None:
             return
         try:
             self.store.persist_neural_model(
-                self.name, json.dumps((self.weights, self.biases),
+                self.name, json.dumps({'goal_supervision': 'verified_only',
+                                      'weights': self.weights, 'biases': self.biases,
+                                      'goal_error_total': self.goal_error_total,
+                                      'effect_error_total': self.effect_error_total,
+                                      'effect_samples': self.effect_samples},
                                       separators=(',', ':'), allow_nan=False),
                 self.updates, self.goal_samples)
         except (ValueError, sqlite3.Error) as error:
             self.store.last_error = str(error)
 
 
-class PredictiveSkillLearner:
-    def __init__(self, store, game):
+class NeuralTrainingService:
+    def __init__(self, store):
         self.store = store
-        self.global_model = OnlineCausalNetwork(store, '*')
-        self.local_model = OnlineCausalNetwork(store, game, template=self.global_model)
-        self.rng = random.Random()
+        self.global_training = OnlineCausalNetwork(store, '*')
+        self.global_model = self.global_training.snapshot()
+        self.learners = {}
+        self.lock = threading.RLock()
+        self.queue = queue.Queue()
+        self.closed = False
+        self.batch_seconds = TEMPORAL_INITIAL_COMPUTE_SECONDS
+        self.condition = threading.Condition(self.lock)
+        self.submitted = self.completed = self.heldout = 0
+        self.heartbeat = time.monotonic()
+        self.operation_started = None
+        self.current_scope = None
+        self.last_error = ''
+        self.thread = threading.Thread(target=self.run, daemon=True, name='online-model-training')
+        self.thread.start()
+
+    def get(self, game):
+        with self.lock:
+            if game not in self.learners:
+                self.learners[game] = PredictiveSkillLearner(self.store, game, self)
+            return self.learners[game]
+
+    def submit(self, learner, sample, record=None, count_example=True):
+        with self.condition:
+            if self.closed:
+                raise RuntimeError('学习存储已经关闭')
+            if not self.thread.is_alive():
+                self.thread = threading.Thread(target=self.run, daemon=True, name='online-model-training-recovery')
+                self.thread.start()
+            self.submitted += 1
+            self.queue.put((learner, sample, record, count_example))
+
+    @staticmethod
+    def holdout_key(inputs):
+        encoded = json.dumps(list(inputs), separators=(',', ':'), allow_nan=False)
+        digest = hashlib.sha256(encoded.encode('utf-8')).digest()
+        fraction = int.from_bytes(digest, 'big') / (1 << (len(digest) * BITS_PER_BYTE))
+        return digest.hex(), encoded, fraction < 1 / math.sqrt(len(inputs))
+
+    def run(self):
+        while True:
+            try:
+                item = self.queue.get(timeout=ERROR_RETRY_SECONDS)
+            except queue.Empty:
+                with self.condition:
+                    self.heartbeat = time.monotonic()
+                continue
+            if item is None:
+                self.queue.task_done()
+                return
+            learner, sample, record, count_example = item
+            with self.condition:
+                self.current_scope = learner.training_model.name
+                self.operation_started = time.monotonic()
+                self.heartbeat = self.operation_started
+            try:
+                key, encoded, heldout = self.holdout_key(sample[0])
+                if heldout:
+                    if record is not None:
+                        self.store.record_holdout(learner.training_model.name, key, encoded, sample)
+                    self.heldout += 1
+                else:
+                    learner.train_sample(sample, count_example, train_global=record is not None)
+                    if record is not None:
+                        self.store.record_neural_experiences((record,))
+                    learner.local_model = learner.training_model.snapshot()
+                    learner.training_model.persist()
+                    self.global_model = self.global_training.snapshot()
+                    self.global_training.persist()
+            except Exception:
+                self.last_error = traceback.format_exc()
+                self.store.event('learning_error', self.last_error)
+            finally:
+                self.queue.task_done()
+                with self.condition:
+                    self.completed += 1
+                    self.heartbeat = time.monotonic()
+                    self.operation_started = self.current_scope = None
+                    self.condition.notify_all()
+            time.sleep(0)
+
+    def telemetry(self):
+        with self.lock:
+            models = [learner.local_model for learner in self.learners.values()]
+        return {'pending': self.queue.qsize(), 'worker_alive': self.thread.is_alive(),
+                'last_error': self.last_error, 'submitted': self.submitted, 'completed': self.completed,
+                'holdout_samples': self.heldout, 'heartbeat_age_seconds': time.monotonic()-self.heartbeat,
+                'current_scope': self.current_scope,
+                'operation_seconds': time.monotonic()-self.operation_started if self.operation_started else None,
+                'models': [{'scope': model.name, 'layers': [model.INPUT_SIZE, *(len(layer) for layer in model.biases)],
+                            'training_updates': model.updates, 'verified_goal_examples': model.goal_samples,
+                            'goal_mae': model.goal_error_total / model.goal_samples if model.goal_samples else None,
+                            'effect_mae': model.effect_error_total / model.effect_samples if model.effect_samples else None}
+                           for model in (*models, self.global_model)]}
+
+    def flush(self, timeout=None):
+        with self.condition:
+            target = self.submitted
+            timeout = (max(DATABASE_BUSY_SECONDS, self.batch_seconds * (target-self.completed+1))
+                       if timeout is None else timeout)
+            deadline = time.monotonic() + timeout
+            while self.completed < target:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0 or not self.thread.is_alive():
+                    raise TimeoutError('模型学习队列尚未完成')
+                self.condition.wait(min(ERROR_RETRY_SECONDS, remaining))
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+        self.flush()
+        self.queue.put(None)
+        self.thread.join(timeout=DATABASE_BUSY_SECONDS)
+        if self.thread.is_alive():
+            raise TimeoutError('模型学习线程尚未关闭')
+
+
+class PredictiveSkillLearner:
+    def __init__(self, store, game, service):
+        self.store = store
+        self.service = service
+        self.training_model = OnlineCausalNetwork(store, game, template=service.global_model)
+        self.local_model = self.training_model.snapshot()
+        self.rng = store.random_stream(type(self).__name__) if store is not None else random.Random(STATE_ENCODING_VERSION)
         self.memory = collections.deque(maxlen=NEURAL_REPLAY_MEMORY)
+        self.verified_memory = collections.deque(maxlen=NEURAL_REPLAY_MEMORY)
+        bootstrap = []
         if store is not None:
             try:
                 for vector, action, goal, reward, effect, verified in store.neural_examples(game):
                     features = json.loads(vector)
-                    if (isinstance(features, list) and
-                            len(features) == OnlineCausalNetwork.INPUT_SIZE and
-                            all(isinstance(value, (int, float)) and math.isfinite(value)
-                                for value in features) and
-                            action in MOUSE_ACTIONS and math.isfinite(reward)
-                            and math.isfinite(effect)):
-                        self.memory.append((features, reward, effect, bool(verified)))
+                    if (isinstance(features, list) and len(features) == OnlineCausalNetwork.INPUT_SIZE and
+                            all(isinstance(value, (int, float)) and math.isfinite(value) for value in features) and
+                            action in (*MOUSE_ACTIONS, KEYBOARD_ACTION_NAME) and
+                            math.isfinite(reward) and math.isfinite(effect)):
+                        sample = (tuple(features), reward if verified else 0.0, effect, bool(verified))
+                        if (self.local_model.updates == 0 or verified and self.local_model.goal_samples == 0):
+                            bootstrap.append(sample)
+                        else:
+                            self.memory.append(sample)
+                            if verified:
+                                self.verified_memory.append(sample)
             except (sqlite3.Error, TypeError, ValueError) as error:
                 store.last_error = str(error)
+        for sample in bootstrap:
+            service.submit(self, sample)
 
-    def readiness(self):
-        return ((self.local_model.updates >= NEURAL_MIN_TOTAL_EXAMPLES
-                 and self.local_model.goal_samples >= NEURAL_MIN_GOAL_EXAMPLES)
+    @property
+    def global_model(self):
+        return self.service.global_model
+
+    def train_sample(self, sample, count_example=True, train_global=True):
+        inputs, target, effect, verified = sample
+        self.memory.append(sample)
+        if verified:
+            self.verified_memory.append(sample)
+        self.training_model.learn(inputs, target, effect, verified, count_example=count_example)
+        if verified and train_global:
+            self.service.global_training.learn(inputs, target, effect, True, count_example=count_example)
+        for index in range(NEURAL_REPLAY_BATCH):
+            if not self.service.queue.empty():
+                break
+            pool = self.verified_memory if self.verified_memory and index % NEURAL_OUTPUT_COUNT == 0 else self.memory
+            replay = self.rng.choice(pool)
+            self.training_model.learn(*replay, count_example=False)
+            if replay[3] and train_global:
+                self.service.global_training.learn(*replay, count_example=False)
+            time.sleep(0)
+
+    def effect_ready(self):
+        return (self.local_model.updates >= NEURAL_MIN_TOTAL_EXAMPLES
+                or self.global_model.updates >= NEURAL_MIN_TOTAL_EXAMPLES)
+
+    def goal_ready(self):
+        return (self.local_model.goal_samples >= NEURAL_MIN_GOAL_EXAMPLES
                 or self.global_model.goal_samples >= NEURAL_MIN_CROSSGAME_EXAMPLES)
 
-    def predict(self, entity, action, goal, destination=None):
+    def readiness(self):
+        return self.effect_ready() or self.goal_ready()
+
+    def predict(self, entity, action, goal, destination=None, keys=(), duration=None):
         dx = destination[0] - entity.x if destination is not None else 0.0
         dy = destination[1] - entity.y if destination is not None else 0.0
         inputs = OnlineCausalNetwork.inputs(
             entity.feature_vector, action, goal, entity.velocity_x, entity.velocity_y,
-            dx, dy)
+            dx, dy, keys, duration)
         if inputs is None:
             return None
-        local = self.local_model.predict(inputs)
-        general = self.global_model.predict(inputs)
-        confidence = self.local_model.goal_samples / (
-            self.local_model.goal_samples + NEURAL_MIN_GOAL_EXAMPLES)
-        general_share = NEURAL_GLOBAL_BLEND * (1.0 - confidence)
-        reward = local[0] * (1.0 - general_share) + general[0] * general_share
-        effect = local[1] * (1.0 - general_share) + general[1] * general_share
-        uncertainty = abs(local[0] - general[0])
+        local_model, global_model = self.local_model, self.global_model
+        local_ready = local_model.updates >= NEURAL_MIN_TOTAL_EXAMPLES
+        global_ready = global_model.updates >= NEURAL_MIN_TOTAL_EXAMPLES
+        if not local_ready and not global_ready:
+            return None
+        local = local_model.predict(inputs) if local_ready else None
+        general = global_model.predict(inputs) if global_ready else None
+        if local is None:
+            effect = general[1]
+        elif general is None:
+            effect = local[1]
+        else:
+            confidence = local_model.updates / (
+                local_model.updates + NEURAL_MIN_TOTAL_EXAMPLES)
+            share = NEURAL_GLOBAL_BLEND * (1.0 - confidence)
+            effect = local[1] * (1.0 - share) + general[1] * share
+        local_goal = local is not None and local_model.goal_samples >= NEURAL_MIN_GOAL_EXAMPLES
+        global_goal = general is not None and global_model.goal_samples >= NEURAL_MIN_CROSSGAME_EXAMPLES
+        if local_goal and global_goal:
+            confidence = local_model.goal_samples / (
+                local_model.goal_samples + NEURAL_MIN_GOAL_EXAMPLES)
+            share = NEURAL_GLOBAL_BLEND * (1.0 - confidence)
+            reward = local[0] * (1.0 - share) + general[0] * share
+        elif local_goal:
+            reward = local[0]
+        elif global_goal:
+            reward = general[0]
+        else:
+            reward = 0.0
+        uncertainty = (abs(local[1] - general[1]) if local is not None
+                       and general is not None else 0.0)
         return reward, effect, uncertainty
 
     def observe(self, entity, action, goal, reward, effect, goal_feedback,
-                destination=None, verified_goal=False):
-        if action not in MOUSE_ACTIONS or entity is None or not entity.feature_vector:
+                destination=None, verified_goal=False, keys=(), duration=None,
+                causal_confidence=0.0):
+        if (action not in (*MOUSE_ACTIONS, KEYBOARD_ACTION_NAME) or
+                entity is None or not entity.feature_vector):
             return
         dx = destination[0] - entity.x if destination is not None else 0.0
         dy = destination[1] - entity.y if destination is not None else 0.0
         inputs = OnlineCausalNetwork.inputs(
             entity.feature_vector, action, goal, entity.velocity_x, entity.velocity_y,
-            dx, dy)
+            dx, dy, keys, duration)
         if inputs is None:
             return
         verified = (verified_goal and goal_feedback is not None
                     and math.isfinite(goal_feedback))
-        target = (goal_feedback if verified else reward * NEURAL_INTRINSIC_TRAIN_SHARE)
+        attribution = (min(1.0, max(0.0, causal_confidence))
+                       if isinstance(causal_confidence, (int, float))
+                       and math.isfinite(causal_confidence) else 0.0)
+        verified_weight = (OBJECTIVE_TRACE_CAUSAL_FLOOR +
+                           (1.0 - OBJECTIVE_TRACE_CAUSAL_FLOOR) * attribution)
+        target = goal_feedback * verified_weight if verified else 0.0
         target_effect = min(NEURAL_MAX_EFFECT_TARGET, max(0.0, effect * VISUAL_CHANGE_SCALE))
-        self.memory.append((inputs, target, target_effect, verified))
-        self.local_model.learn(inputs, target, target_effect, verified)
-        if verified:
-            self.global_model.learn(inputs, target, target_effect, True)
-        for _ in range(NEURAL_REPLAY_BATCH):
-            replay_input, replay_reward, replay_effect, replay_verified = self.rng.choice(self.memory)
-            self.local_model.learn(replay_input, replay_reward, replay_effect, False)
-            if replay_verified:
-                self.global_model.learn(replay_input, replay_reward, replay_effect, False)
-        try:
-            self.store.record_neural_experience(
-                self.local_model.name, inputs, action, goal,
-                target, target_effect, verified)
-        except sqlite3.Error as error:
-            self.store.last_error = str(error)
+        inputs = tuple(inputs)
+        self.service.submit(self, (inputs, target, target_effect, bool(verified)),
+                            (self.local_model.name, inputs, action, goal,
+                             target, target_effect, bool(verified)))
 
     def choose(self, scene, goal):
         if not self.readiness():
@@ -5614,8 +7331,6 @@ class PredictiveSkillLearner:
                                 >= NEURAL_MIN_DESTINATION_DISTANCE)
             destinations = destinations[:NEURAL_MAX_DESTINATION_CANDIDATES]
             for action in MOUSE_ACTIONS[:NEURAL_MAX_CANDIDATE_ACTIONS]:
-                if action == '相对移动':
-                    continue
                 options = (destinations[1:] if action in ACTION_DESTINATION_ACTIONS
                            else destinations[:1])
                 for destination in options:
@@ -5691,7 +7406,7 @@ class ReasoningEvolution:
 class JointTimingLearner:
     def __init__(self, store):
         self.store = store
-        self.random = random.Random()
+        self.random = store.random_stream(type(self).__name__) if store is not None else random.Random(STATE_ENCODING_VERSION)
 
     def choose(self, game, coarse, action, keys):
         try:
@@ -5774,17 +7489,38 @@ class PerceptualRegionDetector:
         with_motion = (previous is not None and
                        (previous.width, previous.height, previous.bounds) ==
                        (frame.width, frame.height, frame.bounds))
-        for gy in range(rows):
-            py = min(frame.height - 1, gy * stride + stride // 2)
-            for gx in range(columns):
-                px = min(frame.width - 1, gx * stride + stride // 2)
-                offset = (py * frame.width + px) * BYTES_PER_RGB_PIXEL
-                rgb = frame.rgb[offset:offset + BYTES_PER_RGB_PIXEL]
-                pixels.append((px, py))
-                colors.append(tuple(channel >> SEMANTIC_COMPONENT_COLOR_SHIFT for channel in rgb))
-                motions.append((sum(abs(rgb[i] - previous.rgb[offset + i])
-                                    for i in range(BYTES_PER_RGB_PIXEL)) / (
-                                        BYTES_PER_RGB_PIXEL * COLOR_MAX)) if with_motion else 0.0)
+        numpy = NUMPY_ACCELERATOR
+        if numpy is not None:
+            with numpy_operation():
+                xs = numpy.minimum(frame.width - 1,
+                                   numpy.arange(columns) * stride + stride // 2)
+                ys = numpy.minimum(frame.height - 1,
+                                   numpy.arange(rows) * stride + stride // 2)
+                sampled = numpy.frombuffer(frame.rgb, dtype=numpy.uint8).reshape(
+                    frame.height, frame.width, BYTES_PER_RGB_PIXEL)[ys[:, None], xs[None, :]]
+                colors = [tuple(map(int, rgb)) for rgb in (
+                    sampled >> SEMANTIC_COMPONENT_COLOR_SHIFT).reshape(-1, BYTES_PER_RGB_PIXEL)]
+                pixels = [(int(px), int(py)) for py in ys for px in xs]
+                if with_motion:
+                    previous_pixels = numpy.frombuffer(previous.rgb, dtype=numpy.uint8).reshape(
+                        frame.height, frame.width, BYTES_PER_RGB_PIXEL)[ys[:, None], xs[None, :]]
+                    motions = (numpy.abs(sampled.astype(numpy.int16)
+                                         - previous_pixels.astype(numpy.int16)).mean(axis=2)
+                               / COLOR_MAX).ravel().tolist()
+                else:
+                    motions = [0.0] * count
+        else:
+            for gy in range(rows):
+                py = min(frame.height - 1, gy * stride + stride // 2)
+                for gx in range(columns):
+                    px = min(frame.width - 1, gx * stride + stride // 2)
+                    offset = (py * frame.width + px) * BYTES_PER_RGB_PIXEL
+                    rgb = frame.rgb[offset:offset + BYTES_PER_RGB_PIXEL]
+                    pixels.append((px, py))
+                    colors.append(tuple(channel >> SEMANTIC_COMPONENT_COLOR_SHIFT for channel in rgb))
+                    motions.append((sum(abs(rgb[i] - previous.rgb[offset + i])
+                                        for i in range(BYTES_PER_RGB_PIXEL)) / (
+                                            BYTES_PER_RGB_PIXEL * COLOR_MAX)) if with_motion else 0.0)
         visited = bytearray(count)
         ranked = []
         for start in range(count):
@@ -6194,7 +7930,9 @@ class SemanticMotionTracker:
                            + SEMANTIC_TRANSITION_SMOOTHING * prior.velocity_y)
             entity.velocity_x = speed_x
             entity.velocity_y = speed_y
-            entity.motion_confidence = -negative_confidence
+            speed = math.hypot(speed_x, speed_y)
+            entity.motion_confidence = (-negative_confidence if speed >=
+                                        SEMANTIC_RELATION_MOTION_MIN_SPEED else 0.0)
         for entity in scene.objects:
             if entity.track is None:
                 self.next_track += 1
@@ -6203,7 +7941,8 @@ class SemanticMotionTracker:
 
 class WorldPlanner:
     @staticmethod
-    def routes(rows, objectives, exploratory=False):
+    def routes(rows, objectives, exploratory=False,
+               planning_budget_seconds=TEMPORAL_INITIAL_COMPUTE_SECONDS):
         choices = collections.defaultdict(lambda: collections.defaultdict(list))
         state_visits = collections.Counter()
         for edge in rows:
@@ -6238,7 +7977,10 @@ class WorldPlanner:
         if not choices:
             return {}
         values = {}
-        for _ in range(WORLD_MODEL_HORIZON):
+        planning_started = time.monotonic()
+        for iteration in range(WORLD_MODEL_HORIZON):
+            if iteration and time.monotonic() - planning_started >= planning_budget_seconds:
+                break
             next_values = {}
             delta = 0.0
             for source, actions in choices.items():
@@ -6285,7 +8027,7 @@ class WorldPlanner:
 class HierarchicalProgramController:
     def __init__(self, store):
         self.store = store
-        self.random = random.Random()
+        self.random = store.random_stream(type(self).__name__) if store is not None else random.Random(STATE_ENCODING_VERSION)
         self.game = None
         self.active = None
         self.index = 0
@@ -6376,6 +8118,7 @@ class HierarchicalProgramController:
                     self.pending = (identifier, step[1])
                     return PROGRAM_MIN_EVIDENCE, 1.0, step[2], *step[4:8]
                 self.cooldown[identifier] = self.decisions + PROGRAM_COOLDOWN_ACTIONS
+                self.store.reasoning_program_feedback(game, identifier, False, 1.0)
                 self.cancel()
             else:
                 self.cooldown[identifier] = self.decisions + PROGRAM_COOLDOWN_ACTIONS
@@ -6457,7 +8200,7 @@ class VerifiedSequenceController:
         self.store = store
         self.programs = HierarchicalProgramController(store)
         self.last_kind = 'verified_sequence'
-        self.rng = random.Random()
+        self.rng = store.random_stream(type(self).__name__) if store is not None else random.Random(STATE_ENCODING_VERSION)
         self.game = None
         self.active = None
         self.index = 0
@@ -6477,26 +8220,29 @@ class VerifiedSequenceController:
             self.cancel()
             self.cooldowns.clear()
             self.decisions = 0
-        candidate = self.programs.decide(game, coarse, signature, objective, forbidden, stagnation)
-        if candidate is not None:
-            self.last_kind = 'compositional_program'
-            self.pending = None
-            self.active = None
-            self.index = 0
-            return candidate
-        self.last_kind = 'verified_sequence'
         self.decisions += 1
         self.pending = None
         if self.active is not None:
             record_id, script = self.active
             if self.index < len(script) and sequence_state_matches(script[self.index], coarse, signature):
                 step = script[self.index]
-                parsed = parse_control_action(step[2], forbidden)
-                if parsed is not None:
+                if parse_control_action(step[2], forbidden) is not None:
+                    self.last_kind = 'verified_sequence'
                     self.pending = record_id, self.index, step[1]
                     return (SEQUENCE_REPLAY_MIN_VALUE, 1.0, step[2],
                             step[4], step[5], step[6], step[7])
-            self.cancel()
+            try:
+                self.store.verified_sequence_feedback(record_id, False)
+            except sqlite3.Error as error:
+                self.store.last_error = str(error)
+            self.cooldowns[record_id] = self.decisions + SEQUENCE_COOLDOWN
+            self.active = None
+            self.index = 0
+        candidate = self.programs.decide(game, coarse, signature, objective, forbidden, stagnation)
+        if candidate is not None:
+            self.last_kind = 'compositional_program'
+            return candidate
+        self.last_kind = 'verified_sequence'
         try:
             rows = self.store.verified_sequence_candidates(game, coarse, objective)
         except sqlite3.Error as error:
@@ -6617,7 +8363,8 @@ class LongHorizonPlanner:
         self.decision_count = 0
 
     @staticmethod
-    def routes(edges, terminals):
+    def routes(edges, terminals,
+               planning_budget_seconds=TEMPORAL_INITIAL_COMPUTE_SECONDS):
         evidence = collections.defaultdict(dict)
         for state, result, confidence, *remaining in terminals:
             if result not in ("win", "loss") or confidence < SEMANTIC_TERMINAL_CONFIDENCE:
@@ -6683,7 +8430,10 @@ class LongHorizonPlanner:
             return {}, "explore"
         values = dict(terminal_value)
         selected_actions = {}
-        for _ in range(SEMANTIC_PLANNING_HORIZON):
+        planning_started = time.monotonic()
+        for iteration in range(SEMANTIC_PLANNING_HORIZON):
+            if iteration and time.monotonic() - planning_started >= planning_budget_seconds:
+                break
             changes = 0.0
             updated = dict(terminal_value)
             for source, actions in transitions.items():
@@ -6742,7 +8492,8 @@ class LongHorizonPlanner:
             self.last_expected, self.last_route_choice = self.pending
             self.pending = None
 
-    def decide(self, store, game, state, scene, objective="general"):
+    def decide(self, store, game, state, scene, objective="general",
+               planning_budget_seconds=None):
         if self.game != game:
             self.reset(game)
         self.decision_count += 1
@@ -6769,7 +8520,7 @@ class LongHorizonPlanner:
         self.last_expected = None
         self.last_route_choice = None
         try:
-            routes, goal = store.semantic_routes(game, objective)
+            routes, goal = store.semantic_routes(game, objective, planning_budget_seconds)
         except sqlite3.Error as error:
             store.last_error = str(error)
             return None
@@ -7165,6 +8916,8 @@ class TerminalRecognizer:
         self.pending_scene = None
         self.pending_scene_count = 0
         self.pending_changed = False
+        self.seen_nonterminal = False
+        self.pending_score = 0.0
         self.confirmed = None
         self.confirmed_scene = None
         self.last_terminal_seen = 0.0
@@ -7172,6 +8925,8 @@ class TerminalRecognizer:
         self.milestone = None
         self.ended = None
         self.budget = None
+        self.last_frame_id = None
+        self.last_frame_time = None
 
     def reset(self):
         self.last_check = 0.0
@@ -7182,6 +8937,8 @@ class TerminalRecognizer:
         self.pending_scene = None
         self.pending_scene_count = 0
         self.pending_changed = False
+        self.seen_nonterminal = False
+        self.pending_score = 0.0
         self.confirmed = None
         self.confirmed_scene = None
         self.last_terminal_seen = 0.0
@@ -7199,25 +8956,36 @@ class TerminalRecognizer:
         self.milestone = None
         return result
 
-    def observe(self, frame, scene_signature=None, scene_changed=False):
+    def observe(self, frame, scene_signature=None, scene_changed=False, action_effect=0.0):
+        frame_id = frame.frame_id
+        captured_at = frame.captured_at
+        if (frame_id == self.last_frame_id or
+                self.last_frame_time is not None and captured_at <= self.last_frame_time):
+            return None
         now = time.monotonic()
         interval = (TERMINAL_PENDING_SCAN_INTERVAL_SECONDS if self.pending is not None
                     else TERMINAL_SCAN_INTERVAL_SECONDS)
         if now - self.last_check < interval:
             return None
         self.last_check = now
+        self.last_frame_id = frame_id
+        self.last_frame_time = captured_at
         try:
             with self.native.semantic_text_lock:
                 if self.native.semantic_text_spotter is None:
                     self.native.semantic_text_spotter = TerminalWordSpotter(self.native, self.budget)
                 else:
                     self.native.semantic_text_spotter.budget = self.budget
-                observed = self.native.semantic_text_spotter.match(frame)
+                observations = [self.native.semantic_text_spotter.match(image)
+                                for image in (frame, *frame.details)]
+                observed = max((item for item in observations if item is not None),
+                               key=lambda item: item[1], default=None)
         except VisionAcceleratorError:
             raise
         except Exception:
             return None
         if observed is None or observed[1] < TERMINAL_MATCH_THRESHOLD:
+            self.seen_nonterminal = True
             if self.confirmed is not None:
                 if (scene_signature is not None and self.confirmed_scene is not None
                         and scene_signature != self.confirmed_scene):
@@ -7235,12 +9003,10 @@ class TerminalRecognizer:
                 self.pending_scene = None
                 self.pending_scene_count = 0
                 self.pending_changed = False
-                self.confirmed = None
-                self.confirmed_scene = None
-                self.new_round_absences = 0
                 self.milestone = None
             return None
         label, score, word = observed
+        self.pending_score = score
         self.last_terminal_seen = now
         self.new_round_absences = 0
         if (label == self.pending and word == self.pending_word
@@ -7255,13 +9021,13 @@ class TerminalRecognizer:
             self.pending_scene_count = 1
             self.pending_changed = False
         self.pending_scene = scene_signature
-        self.pending_changed |= bool(scene_changed)
+        self.pending_changed |= bool(scene_changed and action_effect >= SEMANTIC_TRANSITION_EFFECT_THRESHOLD)
         self.pending_time = now
         if self.pending_count < TERMINAL_REQUIRED_OBSERVATIONS or self.confirmed == label:
             return None
-        if (label in ('win', 'loss') and not self.pending_changed
-                and (self.pending_count < TERMINAL_TEXT_ONLY_OBSERVATIONS
-                     or self.pending_scene_count < TERMINAL_REQUIRED_OBSERVATIONS)):
+        if (label in ('win', 'loss') and
+                (not self.seen_nonterminal or not self.pending_changed
+                 or self.pending_scene_count < TERMINAL_REQUIRED_OBSERVATIONS)):
             return None
         self.confirmed = label
         self.confirmed_scene = scene_signature
@@ -7272,6 +9038,25 @@ class TerminalRecognizer:
             self.ended = score, word
             return None
         return label, score, word
+
+    def corroborate(self, events, scene_signature=None):
+        if (self.confirmed is not None or self.pending not in ('win', 'loss')
+                or self.pending_count < TERMINAL_REQUIRED_OBSERVATIONS
+                or not self.seen_nonterminal
+                or time.monotonic() - self.pending_time > TERMINAL_OBSERVATION_WINDOW_SECONDS):
+            return None
+        for event in events:
+            category = event.get('category')
+            direction = event.get('direction')
+            confidence = event.get('confidence', 0.0)
+            relevant = ((self.pending == 'win' and category == 'wins' and direction == 1)
+                        or (self.pending == 'loss' and category == 'deaths' and direction == 1))
+            if (relevant and isinstance(confidence, (int, float))
+                    and math.isfinite(confidence) and confidence >= GOAL_POSITIVE_EVENT_CONFIDENCE):
+                self.confirmed = self.pending
+                self.confirmed_scene = scene_signature
+                return self.pending, min(confidence, self.pending_score), self.pending_word
+        return None
 
 
 class GoalObservation:
@@ -7302,6 +9087,7 @@ class GoalReader:
         self.label_cache = {}
         self.bar_tracks = {}
         self.hud_cache = {}
+        self.last_readings = ()
         self.budget = None
         self.label_index = 0
         self.label_jobs = tuple((word, category, height, family)
@@ -7322,6 +9108,7 @@ class GoalReader:
         self.label_cache.clear()
         self.bar_tracks.clear()
         self.hud_cache.clear()
+        self.last_readings = ()
 
     @staticmethod
     def hud_region_digest(frame, reading):
@@ -7838,6 +9625,38 @@ class GoalReader:
                 attributed.append({**entry, "strength": residual})
         return attributed
 
+    def readings(self, frame):
+        key = ('multiscale_hud',)
+        if key in frame.cache:
+            self.last_readings = frame.cache[key]
+            return self.last_readings
+        merged = list(self.numbers(frame, discover_labels=False) + self.bars(frame))
+        left, top, width, height = frame.bounds
+        for detail in frame.details:
+            hud_cache, label_cache = self.hud_cache, self.label_cache
+            self.hud_cache, self.label_cache = {}, {}
+            try:
+                local = self.numbers(detail, discover_labels=True) + self.bars(detail)
+            finally:
+                self.hud_cache, self.label_cache = hud_cache, label_cache
+            x, y, w, h = detail.bounds
+            for item in local:
+                reading = GoalObservation(item.kind, item.category,
+                    (x - left + item.x * w) / width, (y - top + item.y * h) / height,
+                    item.value, item.confidence, item.height * frame.height / max(1, height))
+                candidates = [entry for entry in merged if entry.kind == reading.kind
+                    and abs(entry.x-reading.x) <= OBJECTIVE_ANCHOR_DISTANCE
+                    and abs(entry.y-reading.y) <= OBJECTIVE_ANCHOR_DISTANCE]
+                if candidates:
+                    match = min(candidates, key=lambda entry: math.hypot(entry.x-reading.x, entry.y-reading.y))
+                    if match.confidence > reading.confidence:
+                        continue
+                    merged.remove(match)
+                merged.append(reading)
+        self.last_readings = tuple(merged)
+        frame.cache[key] = self.last_readings
+        return self.last_readings
+
     def observe(self, before, after, commit=True):
         if not commit:
             shadow = copy.copy(self)
@@ -7848,8 +9667,8 @@ class GoalReader:
         if before is None or after is None or (before.width, before.height, before.bounds) != (
                 after.width, after.height, after.bounds):
             return []
-        previous = self.numbers(before, discover_labels=False) + self.bars(before)
-        following = self.numbers(after, discover_labels=False) + self.bars(after)
+        previous = self.readings(before)
+        following = self.readings(after)
         changes = []
         used = set()
         tracking = {}
@@ -8048,14 +9867,15 @@ class VisionPolicy:
     def __init__(self, store, game_id="desktop", native=None):
         self.store = store
         self.game_id = game_id
-        self.rng = random.Random()
+        self.rng = store.random_stream(type(self).__name__) if store is not None else random.Random(STATE_ENCODING_VERSION)
         self.semantic_scene = SemanticScene(())
         self.concepts = VisualConceptLearner(store)
-        self.predictor = PredictiveSkillLearner(store, game_id) if store is not None else None
+        self.predictor = store.neural_predictor(game_id) if store is not None else None
         self.evolution = ReasoningEvolution(store) if store is not None else None
         self.motion_tracker = SemanticMotionTracker()
         self.grounder = GroundedSemanticLearner(store, game_id)
         self.last_decision_source = 'exploration'
+        self.evaluation_episode = None
         self.last_transfer_used = False
         self.semantic_transfer = {}
         self.episode_transfer = {}
@@ -8071,7 +9891,9 @@ class VisionPolicy:
         self.last_goal_feedback = None
         self.last_reward_channels = {}
         self.last_goal_scan_at = 0.0
+        self.delayed_frame = None
         self.last_control_motion = 0.0
+        self.last_localization_quality = None
         self.planner = LongHorizonPlanner()
         self.terminal = TerminalRecognizer(native) if native is not None else None
         self.last_outcome = None
@@ -8160,22 +9982,79 @@ class VisionPolicy:
             return target.x, target.y
         return x, y
 
-    def recovery_penalty(self, context, cell, spot, action):
-        if max(self.no_effect_steps, self.director.no_progress) < RECOVERY_START_STEPS:
+    def adaptive_value(self, context, name, initial):
+        if self.store is None:
+            return initial
+        try:
+            return self.store.calibration(self.game_id, context, name, initial)['value']
+        except sqlite3.Error as error:
+            self.store.last_error = str(error)
+            return initial
+
+    def control_penalty(self, context, cell, spot, action, keys=(), demonstration_id=None):
+        cost = self.recovery_penalty(context, cell, spot, action, keys)
+        if demonstration_id is not None and self.store is not None:
+            try:
+                history = self.store.demonstration_replay_history(self.game_id, context)
+            except sqlite3.Error as error:
+                self.store.last_error = str(error)
+                return cost
+            record = history.get((demonstration_id, control_action_key(action, cell, spot, keys)))
+            if record is not None:
+                n, reward, successes, noops = record
+                cost += math.log1p(noops) * (n - successes) / max(1, n)
+        return cost
+
+    def recovery_penalty(self, context, cell, spot, action, keys=()):
+        threshold = self.adaptive_value(context, 'recovery_steps', RECOVERY_START_STEPS)
+        if max(self.no_effect_steps, self.director.no_progress) < threshold:
             return 0.0
         result = 0.0
         for age, (source, recorded_cell, recorded_spot, recorded_action, success) in enumerate(
                 reversed(self.recovery_history)):
-            if source != context or recorded_cell != cell or recorded_action != action:
+            expected = control_action_key(action, recorded_cell, recorded_spot, keys)
+            if (source != context or recorded_action != expected or
+                    action != KEYBOARD_ACTION_NAME and recorded_cell != cell):
                 continue
             if success > RECOVERY_EFFECT_THRESHOLD:
                 continue
             weight = RECOVERY_DECAY ** age
-            if recorded_spot == spot:
+            if action == KEYBOARD_ACTION_NAME or recorded_spot == spot:
                 result += RECOVERY_PENALTY_PER_REPEAT * weight
             else:
                 result += RECOVERY_PENALTY_PER_BAD_ACTION * RECOVERY_DIFFERENT_SPOT_WEIGHT * weight
         return min(RECOVERY_MAX_PENALTY, result)
+
+    @staticmethod
+    def spatial_signature(frame, side):
+        signature = []
+        contrast_levels = FINGERPRINT_SIDE
+        for row in range(side):
+            top, bottom = frame.height * row // side, frame.height * (row + 1) // side
+            for column in range(side):
+                left, right = frame.width * column // side, frame.width * (column + 1) // side
+                stride = max(1, math.ceil(math.sqrt(max(1, (bottom-top) * (right-left)) /
+                    max(1, VISION_CONTEXT_SAMPLE_BUDGET // (side * side)))))
+                samples = [frame.gray[y * frame.width + x]
+                           for y in range(top, bottom, stride) for x in range(left, right, stride)]
+                if not samples:
+                    signature.extend('000')
+                    continue
+                ordered = sorted(samples)
+                background = ordered[len(ordered) // 2]
+                deviations = [abs(value-background) for value in samples]
+                contrast = math.sqrt(sum(value * value for value in deviations) / len(samples))
+                count = sum(value > max(1.0, contrast) for value in deviations)
+                fraction = count / len(samples)
+                signature.extend(str(min(contrast_levels - 1, int(value * contrast_levels)))
+                                 for value in (background / (COLOR_MAX + 1),
+                                               math.sqrt(contrast / (COLOR_MAX + 1)),
+                                               math.sqrt(fraction)))
+        return ''.join(signature)
+
+    @staticmethod
+    def transfer_signature(context):
+        return str(context).rsplit('-', 1)[-1].split(':', 1)[0]
 
     def context(self, frame):
         key = ("context", self.game_id)
@@ -8184,6 +10063,7 @@ class VisionPolicy:
             return cached
         levels = []
         colors = []
+        edges = []
         stride = max(1, math.ceil(math.sqrt(frame.width * frame.height / VISION_CONTEXT_SAMPLE_BUDGET)))
         numpy = NUMPY_ACCELERATOR
         if numpy is not None:
@@ -8205,10 +10085,17 @@ class VisionPolicy:
                         sample = int(region_gray.sum())
                         saturation = int((region_rgb.max(axis=2).astype(numpy.int16) - region_rgb.min(axis=2)).sum())
                         total = region_gray.size
+                        signed = region_gray.astype(numpy.int16)
+                        edge_sum = (int(numpy.abs(signed[:, 1:] - signed[:, :-1]).sum())
+                                    + int(numpy.abs(signed[1:, :] - signed[:-1, :]).sum()))
+                        edge_count = (signed.shape[0] * max(0, signed.shape[1] - 1)
+                                      + signed.shape[1] * max(0, signed.shape[0] - 1))
                 else:
                     sample = 0
                     saturation = 0
                     total = 0
+                    edge_sum = 0
+                    edge_count = 0
                     for y in range(y0, y1, stride):
                         start = y * frame.width
                         for x in range(x0, x1, stride):
@@ -8217,11 +10104,20 @@ class VisionPolicy:
                             offset = index * BYTES_PER_RGB_PIXEL
                             red, green, blue = rgb[offset], rgb[offset + 1], rgb[offset + 2]
                             saturation += max(red, green, blue) - min(red, green, blue)
+                            if x - stride >= x0:
+                                edge_sum += abs(frame.gray[index] - frame.gray[index - stride])
+                                edge_count += 1
+                            if y - stride >= y0:
+                                edge_sum += abs(frame.gray[index] - frame.gray[index - stride * frame.width])
+                                edge_count += 1
                             total += 1
+                edges.append(min(CONTEXT_EDGE_LEVELS - 1,
+                                 edge_sum * CONTEXT_EDGE_LEVELS // max(1, edge_count * (COLOR_MAX + 1))))
                 levels.append(min(CONTEXT_LEVELS - 1, sample * CONTEXT_LEVELS // max(1, total * (COLOR_MAX + 1))))
                 colors.append(min(CONTEXT_SATURATION_LEVELS - 1, saturation * CONTEXT_SATURATION_LEVELS // max(1, total * (COLOR_MAX + 1))))
         coarse_levels = []
         coarse_colors = []
+        coarse_edges = []
         for row in range(COARSE_CONTEXT_ROWS):
             for column in range(COARSE_CONTEXT_COLUMNS):
                 indices = [r * CONTEXT_COLUMNS + c
@@ -8230,19 +10126,30 @@ class VisionPolicy:
                            and c * COARSE_CONTEXT_COLUMNS // CONTEXT_COLUMNS == column]
                 average_level = sum(levels[index] for index in indices) / max(1, len(indices))
                 average_color = sum(colors[index] for index in indices) / max(1, len(indices))
+                average_edge = sum(edges[index] for index in indices) / max(1, len(indices))
+                coarse_edges.append(str(min(COARSE_CONTEXT_EDGE_LEVELS - 1,
+                    round(average_edge * (COARSE_CONTEXT_EDGE_LEVELS - 1) /
+                          max(1, CONTEXT_EDGE_LEVELS - 1)))))
                 coarse_levels.append(str(min(COARSE_CONTEXT_LEVELS - 1, round(average_level * (COARSE_CONTEXT_LEVELS - 1) / max(1, CONTEXT_LEVELS - 1)))))
                 coarse_colors.append(str(min(COARSE_CONTEXT_SATURATION_LEVELS - 1, round(average_color * (COARSE_CONTEXT_SATURATION_LEVELS - 1) / max(1, CONTEXT_SATURATION_LEVELS - 1)))))
-        exact = self.game_id + "-" + "".join(map(str, levels)) + "".join(map(str, colors))
-        coarse = self.game_id + "-" + "".join(coarse_levels) + "".join(coarse_colors)
+        exact = (self.game_id + "-" + "".join(map(str, levels)) +
+                 "".join(map(str, colors)) + "".join(map(str, edges)))
+        coarse = (self.game_id + "-" + "".join(coarse_levels) +
+                  "".join(coarse_colors) + "".join(coarse_edges))
+        identity = frame.target_identity
+        window_class = identity[1][1] if identity and identity[1] else frame.cache.get('window_class', '')
+        family = hashlib.blake2b(str(window_class).encode('utf-8'), digest_size=FINGERPRINT_SIDE).hexdigest()
+        fine_spatial = self.spatial_signature(frame, FINGERPRINT_SIDE)
+        coarse_spatial = self.spatial_signature(frame, max(COARSE_CONTEXT_COLUMNS, COARSE_CONTEXT_ROWS))
+        exact += ':' + fine_spatial + ':' + family
+        coarse += ':' + coarse_spatial + ':' + family
         frame.cache[key] = (exact, coarse)
         return exact, coarse
 
     def reset_scene(self, game_id=None):
         if game_id is not None and game_id != self.game_id:
             if self.predictor is not None:
-                self.predictor.local_model.persist()
-                self.predictor.global_model.persist()
-                self.predictor = PredictiveSkillLearner(self.store, game_id)
+                self.predictor = self.store.neural_predictor(game_id)
             self.game_id = game_id
         self.prior = None
         self.last_cell = None
@@ -8275,6 +10182,7 @@ class VisionPolicy:
         self.motion_tracker.reset()
         self.grounder = GroundedSemanticLearner(self.store, self.game_id)
         self.last_decision_source = 'exploration'
+        self.evaluation_episode = None
         self.last_transfer_used = False
         self.semantic_transfer = {}
         self.episode_transfer = {}
@@ -8288,7 +10196,9 @@ class VisionPolicy:
         self.last_goal_feedback = None
         self.last_reward_channels = {}
         self.last_goal_scan_at = 0.0
+        self.delayed_frame = None
         self.last_control_motion = 0.0
+        self.last_localization_quality = None
         if self.goals is not None:
             self.goals.reset()
         self.planner.reset(self.game_id)
@@ -8354,12 +10264,18 @@ class VisionPolicy:
 
     def coarse_context_distance(self, first, second):
         try:
-            left = first.rsplit("-", 1)[1]
-            right = second.rsplit("-", 1)[1]
-            if len(left) != len(right):
+            left = first.rsplit('-', 1)[1].split(':')
+            right = second.rsplit('-', 1)[1].split(':')
+            if len(left) != len(right) or len(left[0]) != len(right[0]):
                 return math.inf
-            return sum(abs(int(a) - int(b)) for a, b in zip(left, right))
-        except (IndexError, ValueError):
+            distance = sum(abs(int(a) - int(b)) for a, b in zip(left[0], right[0]))
+            if len(left) > 1:
+                if left[-1] != right[-1] or len(left[1]) != len(right[1]):
+                    return math.inf
+                spatial = sum(abs(int(a) - int(b)) for a, b in zip(left[1], right[1]))
+                distance += spatial * len(left[0]) / max(1, len(left[1]) * FINGERPRINT_SIDE)
+            return distance
+        except (IndexError, ValueError, AttributeError):
             return math.inf
 
     def salience(self, frame):
@@ -8564,6 +10480,7 @@ class VisionPolicy:
                 self.game_id, coarse_context, fingerprint, self.temporal.signature)
             self.transfer_goals.extend(keyboard_goals)
             rows, priors = self.store.demonstration_examples(self.game_id, context, coarse_context)
+            replay_history = self.store.demonstration_replay_history(self.game_id, coarse_context)
             episode_actions, episode_spots = self.store.episode_history(self.game_id, coarse_context)
             video_signatures = self.store.demonstration_video_signatures(
                 [example[0] for example in rows])
@@ -8618,6 +10535,8 @@ class VisionPolicy:
             similarity = shape_similarity * color_similarity
             mean_effect = effect / max(1, count)
             effective_visits = min(count, max(0.0, effect * VISUAL_CHANGE_SCALE))
+            replay_n, replay_effect, replay_successes, replay_noops = replay_history.get(
+                (example_id, control_action_key(action, cell, spot)), (0, 0.0, 0, 0))
             replay_quality = replay_effect / replay_n if replay_n else 0.0
             score = (similarity * DEMONSTRATION_SIMILARITY_WEIGHT + scene_bonus
                      + DEMONSTRATION_COUNT_WEIGHT * math.log1p(effective_visits)
@@ -8649,6 +10568,7 @@ class VisionPolicy:
                 score -= DEMONSTRATION_EXPECTED_NOOP_PENALTY
             if mean_effect < VISUAL_EFFECT_THRESHOLD and replay_quality <= 0.0:
                 score -= DEMONSTRATION_EXPECTED_NOOP_PENALTY
+            score -= math.log1p(replay_noops) * (replay_n - replay_successes) / max(1, replay_n)
             proposed.append((score, example, global_match))
         if not proposed:
             return None, priors
@@ -8713,12 +10633,16 @@ class VisionPolicy:
             return None, priors
         matched.sort(reverse=True, key=lambda item: item[0])
         options = matched[:DEMONSTRATION_MAX_CANDIDATES]
-        chance = DEMONSTRATION_BASE_REPLAY_CHANCE / (
+        chance = self.adaptive_value(coarse_context, 'demonstration_chance',
+                                     DEMONSTRATION_BASE_REPLAY_CHANCE) / (
             1.0 + self.no_effect_steps * DEMONSTRATION_STAGNATION_DECAY)
         if self.evolution is not None:
             chance = self.evolution.probability(
                 self.game_id, coarse_context, 'demonstration', chance)
         best_example = options[0][1]
+        replay_key = control_action_key(best_example[6], best_example[4], best_example[5])
+        replay_n, _, replay_successes, _ = replay_history.get((best_example[0], replay_key), (0, 0.0, 0, 0))
+        chance *= (replay_successes + 1) / (replay_n + 1)
         best_cell, best_spot, best_action = best_example[4], best_example[5], best_example[6]
         best_outcome = (EPISODE_ACTION_WEIGHT * episode_estimate(
             *episode_actions.get((best_cell, best_action), (0, 0.0, 0)))
@@ -9027,7 +10951,28 @@ class VisionPolicy:
             to_y = min(1.0, max(0.0, to_y + delta_y))
         return x, y, to_x, to_y
 
+    def evaluation_start(self, frame):
+        if self.evaluation_episode is not None:
+            return
+        model = self.predictor.local_model if self.predictor is not None else None
+        self.evaluation_episode = {'game': self.game_id, 'initial_state': self.context(frame)[0],
+            'state_encoding_version': STATE_ENCODING_VERSION, 'started_at': time.monotonic(),
+            'started_utc': utc_stamp(), 'training_updates_at_start': model.updates if model else 0,
+            'verified_examples_at_start': model.goal_samples if model else 0}
+
+    def evaluation_finish(self, outcome):
+        episode = self.evaluation_episode
+        if episode is None or outcome is None:
+            return
+        self.evaluation_episode = None
+        entry = dict(episode, outcome=outcome, elapsed=time.monotonic()-episode['started_at'],
+                     objective=self.director.active)
+        entry.pop('started_at')
+        if self.store is not None:
+            self.store.defer_write('event', 'evaluated_episode', entry)
+
     def pick(self, frame, video=None):
+        self.evaluation_start(frame)
         self.temporal = video if video is not None else VideoFeatures()
         context, coarse_context = self.context(frame)
         salient, fine, centers, motion_level = self.salience(frame)
@@ -9052,8 +10997,11 @@ class VisionPolicy:
                 self.objective_transfer = self.store.crossgame_objectives(self.game_id, features)
                 self.objective_history = self.store.objective_history(self.game_id, coarse_context)
                 current_semantic_states = (coarse_context + "#" + self.semantic_scene.signature, coarse_context)
-                guided = self.planner.decide(self.store, self.game_id, current_semantic_states,
-                                             self.semantic_scene, self.director.active)
+                guided = self.planner.decide(
+                    self.store, self.game_id, current_semantic_states,
+                    self.semantic_scene, self.director.active,
+                    self.local_budget.planning_budget(max(self.no_effect_steps, self.director.no_progress))
+                    if self.local_budget is not None else TEMPORAL_INITIAL_COMPUTE_SECONDS)
             except sqlite3.Error as error:
                 self.store.last_error = str(error)
                 guided = None
@@ -9186,6 +11134,14 @@ class VisionPolicy:
                     candidate_cell, candidate_action, targets, coarse_targets,
                     episode_spots, interaction_model)
         exploration = min(1.0, self.no_effect_steps / POLICY_NO_EFFECT_STEPS)
+        if self.local_budget is not None:
+            telemetry = self.local_budget.telemetry()
+            no_effect_rate = telemetry.get('no_effect_ema')
+            progress_rate = telemetry.get('verified_progress_per_minute_ema')
+            if no_effect_rate is not None:
+                exploration = max(exploration, min(1.0, no_effect_rate))
+            if progress_rate is not None and progress_rate > GOAL_NEGATIVE_PROGRESS_TOLERANCE:
+                exploration *= GENERALIZATION_STRENGTH
         region_visits = [sum(local.get((region, candidate), (0, 0))[0] for candidate in MOUSE_ACTIONS)
                          for region in range(GRID_COLUMNS * GRID_ROWS)]
         total_region_visits = sum(region_visits)
@@ -9268,7 +11224,7 @@ class VisionPolicy:
             general_estimate = coarse_confidence * coarse_average + (1 - coarse_confidence) * global_average
             confidence = local_n / (local_n + GENERALIZATION_PRIOR_VISITS * GENERALIZATION_STRENGTH) if local_n else 0.0
             estimate = confidence * local_average + (1 - confidence) * general_estimate
-            explore = EXPLORATION_STRENGTH * (1.0 + exploration * POLICY_EXPLORATION_BOOST) * math.sqrt(math.log(tries + len(MOUSE_ACTIONS) + 1) / (local_n + 1))
+            explore = self.adaptive_value(coarse_context, 'exploration_strength', EXPLORATION_STRENGTH) * (1.0 + exploration * POLICY_EXPLORATION_BOOST) * math.sqrt(math.log(tries + len(MOUSE_ACTIONS) + 1) / (local_n + 1))
             global_explore = ACTION_GLOBAL_EXPLORATION * (1.0 + exploration * POLICY_EXPLORATION_BOOST) * math.sqrt(
                 math.log(global_tries + len(MOUSE_ACTIONS) + 1) / (overall_n + 1))
             prior = ACTION_PRIOR_WEIGHT * ACTION_PRIORS[action] / math.sqrt(local_n + 1)
@@ -9476,7 +11432,96 @@ class VisionPolicy:
         second.cache[key] = value
         return value
 
-    def update(self, context, cell, spot, action, before, after, background, coarse_context=None, to_cell=None, variant=None, to_x=None, to_y=None, demonstration_id=None, x=None, y=None, video=None, latency=None, response_frames=(), next_video=None, outcome_hint=None, control=None, keyboard_keys=()):
+    def update_transition(self, context, coarse, cell, spot, action, x, y, to_x, to_y, variant,
+                          before, after, keys, video_before, video_after, outcome=None):
+        self.prior = None
+        self.background_ema = None
+        self.last_control_motion = 0.0
+        self.last_localization_quality = None
+        self.last_goal_events = []
+        self.last_goal_score = None
+        self.last_goal_progress = 0.0
+        self.last_outcome = outcome
+        self.last_goal_feedback = ((SEMANTIC_TERMINAL_WIN_REWARD if outcome[0] == 'win'
+                                  else SEMANTIC_TERMINAL_LOSS_REWARD) if outcome else None)
+        self.last_reward_channels = {'verified_goal': self.last_goal_feedback or 0.0,
+                                    'causal_action': 0.0, 'exploration': 0.0,
+                                    'verified': outcome is not None, 'causal_confidence': None}
+        self.last_semantic_event = 'window_transition'
+        following = self.context(after)[1]
+        _, fine, centers, _ = self.salience(after)
+        next_scene = SemanticScene.describe(after, fine, centers, None,
+            self.local_budget.perceptual_samples() if self.local_budget else SEMANTIC_COMPONENT_SAMPLE_BUDGET)
+        self.concepts.attach(next_scene, after, learn=False)
+        control_key = control_action_key(action, cell, spot, keys)
+        self.world_trace.append(WorldTraceStep(coarse, following, control_key,
+            self.semantic_scene.signature, next_scene.signature, video_before.signature,
+            video_after.signature, x, y, to_x, to_y, variant if variant is not None else -1, 0.0))
+        reward = self.last_goal_feedback or 0.0
+        if self.store is not None:
+            self.store.defer_write('record_world_transition', self.game_id, coarse, following,
+                control_key, reward, 0.0, self.last_goal_feedback, (), outcome,
+                self.semantic_scene.signature, next_scene.signature, x, y, to_x, to_y,
+                video_before.signature, video_after.signature)
+            if outcome is not None:
+                self.evaluation_finish(outcome)
+                self.store.defer_write('finish_episode', self.game_id,
+                    tuple(self.world_trace), tuple(self.episode_trace), tuple(self.keyboard_trace),
+                    tuple(self.goal_trace), tuple(self.strategy_trace), tuple(outcome))
+                self.world_trace.clear()
+                self.episode_trace.clear()
+                self.keyboard_trace.clear()
+                self.goal_trace.clear()
+                self.strategy_trace.clear()
+        self.semantic_scene = next_scene
+        self.motion_tracker.reset()
+        self.recent_decisions.clear()
+        self.prior = after
+        self.delayed_frame = after
+        self.last_effect = 0.0
+        return reward, 0.0, 0
+
+    def recognition_quality(self):
+        components = {}
+        if self.last_goal_events:
+            components['objective_confidence'] = sum(event.get('confidence', 0.0)
+                for event in self.last_goal_events) / len(self.last_goal_events)
+        if self.last_outcome is not None:
+            components['outcome_confidence'] = self.last_outcome[1]
+        if self.goals is not None:
+            readings = [item.confidence for item in self.goals.last_readings if item.category != 'unknown']
+            if readings:
+                components['hud_confidence'] = sum(readings) / len(readings)
+        if getattr(self, 'last_localization_quality', None) is not None:
+            components['localization_stability'] = self.last_localization_quality
+        return components or None
+
+    def observe_delayed(self, frame, session_id):
+        prior = self.delayed_frame
+        self.delayed_frame = None
+        if (prior is None or self.goals is None or self.store is None or not self.world_trace
+                or prior.target_identity != frame.target_identity or prior.generation != frame.generation
+                or (prior.width, prior.height, prior.bounds) != (frame.width, frame.height, frame.bounds)
+                or frame.capture_started <= prior.captured_at):
+            return
+        cache = getattr(self.goals, 'hud_cache', None)
+        if cache is not None and not any(entry[1] for entry in cache.values()):
+            return
+        events = self.goals.observe(prior, frame)
+        if not events:
+            return
+        self.goal_trace.extend(events)
+        self.director.observe(events, None)
+        self.store.defer_write('record_goal_metrics', self.game_id, events)
+        self.store.defer_write('credit_world_goals', self.game_id, self.world_trace, events,
+                              include_latest=True)
+        self.store.defer_write('record_verified_sequence', self.game_id, self.world_trace, events, None)
+        self.store.event('delayed_feedback', {'session_id': session_id, 'game_id': self.game_id,
+                         'goal_changes': events, 'before_frame_id': prior.frame_id,
+                         'after_frame_id': frame.frame_id, 'attribution': 'preceding_action_trace'})
+
+    def update(self, context, cell, spot, action, before, after, background, coarse_context=None, to_cell=None, variant=None, to_x=None, to_y=None, demonstration_id=None, x=None, y=None, video=None, latency=None, response_frames=(), next_video=None, outcome_hint=None, control=None, keyboard_keys=(), keyboard_duration=None):
+        episode_length = len(self.world_trace) + 1
         global_effect = self.difference(before, after)
         local_effect = self.difference(before, after, cell)
         spot_effect = self.difference(before, after, cell, spot)
@@ -9548,6 +11593,10 @@ class VisionPolicy:
             following = SemanticScene.describe(after, next_fine, next_centers, before, samples)
             self.concepts.attach(following, after, learn=False)
             previous_scene = self.semantic_scene
+            matches = [following.match(obj.role, obj.shape, obj.x, obj.y)
+                       for obj in previous_scene.objects]
+            self.last_localization_quality = (sum(match is not None for match in matches) / len(matches)
+                                              if matches and following.objects else None)
             semantic_event, semantic_role, semantic_shape = previous_scene.event(
                 following, action, x if x is not None else COORDINATE_CENTER,
                 y if y is not None else COORDINATE_CENTER,
@@ -9560,7 +11609,7 @@ class VisionPolicy:
             self.prior = None
         self.last_semantic_event = semantic_event
         outcome = (outcome_hint if outcome_hint is not None else
-                   (self.terminal.observe(after, next_coarse_context, scene_transition)
+                   (self.terminal.observe(after, next_coarse_context, scene_transition, measured_effect)
                     if self.terminal is not None else None))
         self.last_outcome = outcome
         ended = self.terminal.consume_ended() if self.terminal is not None else None
@@ -9645,6 +11694,9 @@ class VisionPolicy:
             except (sqlite3.Error, ValueError, MemoryError, OverflowError) as error:
                 if self.store is not None:
                     self.store.last_error = str(error)
+        if outcome is None and self.terminal is not None:
+            outcome = self.terminal.corroborate(self.last_goal_events, next_coarse_context)
+            self.last_outcome = outcome
         milestone = self.terminal.consume_milestone() if self.terminal is not None else None
         if milestone is not None:
             confidence, evidence = milestone
@@ -9662,7 +11714,9 @@ class VisionPolicy:
             goal_feedback = (SEMANTIC_TERMINAL_WIN_REWARD if outcome[0] == "win"
                              else SEMANTIC_TERMINAL_LOSS_REWARD)
         verified_goal = (outcome is not None or
-                         bool(self.last_goal_events) and self.last_goal_score is not None)
+                         self.last_goal_score is not None and
+                         any(objective_signal(event) != 0.0
+                             for event in self.last_goal_events))
         verified_goal_feedback = goal_feedback if verified_goal else None
         self.last_goal_feedback = verified_goal_feedback
         try:
@@ -9696,11 +11750,19 @@ class VisionPolicy:
             if len(self.fallback) > FALLBACK_CONTEXT_LIMIT:
                 self.fallback.popitem(last=False)
         goal_feedback = verified_goal_feedback
+        if self.store is not None and demonstration_id is not None:
+            try:
+                self.store.record_demonstration_replay(
+                    self.game_id, coarse_context, demonstration_id,
+                    control_action_key(action, cell, spot, keyboard_keys),
+                    reward, effect, verified_goal_feedback)
+            except sqlite3.Error as error:
+                self.store.last_error = str(error)
         try:
             if self.store is not None and coarse_context and next_coarse_context:
                 control_key = control_action_key(action, cell, spot, keyboard_keys)
                 if control_key:
-                    self.store.record_world_transition(
+                    self.store.defer_write('record_world_transition',
                         self.game_id, coarse_context, next_coarse_context, control_key,
                         reward, effect, goal_feedback, self.last_goal_events, outcome,
                         self.semantic_scene.signature, following.signature,
@@ -9723,18 +11785,18 @@ class VisionPolicy:
                         variant if variant is not None else -1,
                         effect))
                     if self.last_goal_events or outcome is not None:
-                        self.store.record_verified_sequence(
+                        self.store.defer_write('record_verified_sequence',
                             self.game_id, self.world_trace, self.last_goal_events, outcome)
-                        self.store.record_reasoning_programs(
+                        self.store.defer_write('record_reasoning_programs',
                             self.game_id, self.world_trace, self.last_goal_events, outcome)
                     if self.last_goal_events and outcome is None:
-                        self.store.credit_world_goals(
+                        self.store.defer_write('credit_world_goals',
                             self.game_id, self.world_trace, self.last_goal_events)
         except (sqlite3.Error, ValueError, OverflowError) as error:
             self.store.last_error = str(error)
         try:
             if self.store is not None and coarse_context and next_coarse_context and isolated_mouse:
-                self.store.record_semantic(
+                self.store.defer_write('record_semantic',
                     self.game_id, coarse_context, next_coarse_context, cell, spot, action,
                     semantic_role, semantic_shape,
                     x if x is not None else COORDINATE_CENTER,
@@ -9754,7 +11816,7 @@ class VisionPolicy:
         if self.store is not None and x is not None and y is not None and isolated_mouse:
             try:
                 source_entity = self.semantic_scene.nearest(x, y)
-                self.store.record_causal_skill(
+                self.store.defer_write('record_causal_skill',
                     self.game_id, coarse_context, cell, spot, action, variant,
                     source_entity, appearance, x, y,
                     to_x if to_x is not None else x,
@@ -9762,14 +11824,19 @@ class VisionPolicy:
                     effect, reward, self.last_goal_events, outcome, goal_feedback)
             except (sqlite3.Error, ValueError, OverflowError) as error:
                 self.store.last_error = str(error)
-        if (self.predictor is not None and action in MOUSE_ACTIONS
-                and x is not None and y is not None and isolated_mouse):
-            source_entity = self.semantic_scene.nearest(x, y)
+        if self.predictor is not None and action in (*MOUSE_ACTIONS, KEYBOARD_ACTION_NAME):
+            source_entity = (self.semantic_scene.nearest(x, y)
+                             if x is not None and y is not None else None)
+            if source_entity is None and self.semantic_scene.objects:
+                source_entity = max(self.semantic_scene.objects,
+                                    key=lambda entity: (entity.concept_confidence, entity.area))
             if source_entity is not None:
                 destination = (to_x, to_y) if to_x is not None and to_y is not None else None
                 self.predictor.observe(source_entity, action, self.director.active,
                                        reward, effect, goal_feedback, destination,
-                                       verified_goal=verified_goal)
+                                       verified_goal=verified_goal, keys=keyboard_keys,
+                                       duration=keyboard_duration,
+                                       causal_confidence=causal_confidence)
         if coarse_context and action in MOUSE_ACTIONS and isolated_mouse:
             entity = self.semantic_scene.nearest(x, y) if x is not None and y is not None else None
             quality = min(1.0, effect + (OBJECTIVE_TRACE_TRANSITION_BONUS
@@ -9788,7 +11855,7 @@ class VisionPolicy:
             self.keyboard_trace.append((coarse_context, ",".join(map(str, sorted(set(keyboard_keys))))))
         self.director.observe(self.last_goal_events, outcome)
         self.recovery_history.append((coarse_context, cell, spot,
-            action if isolated_mouse else control_action_key(action, cell, spot, keyboard_keys),
+            control_action_key(action, cell, spot, keyboard_keys),
             (-RECOVERY_PENALTY_PER_BAD_ACTION if cyclic_state else
              goal_feedback if goal_feedback is not None else effect)))
         if self.store is not None and (self.episode_trace or self.keyboard_trace):
@@ -9813,19 +11880,12 @@ class VisionPolicy:
                 except sqlite3.Error as error:
                     self.store.last_error = str(error)
         if outcome is not None:
+            self.evaluation_finish(outcome)
             try:
                 if self.store is not None:
-                    self.store.credit_world_episode(
-                        self.game_id, self.world_trace, outcome[0], outcome[1])
-                    recorded_mouse = self.store.record_episode(
-                        self.game_id, self.episode_trace, outcome[0])
-                    self.store.credit_causal_episode(self.game_id, self.episode_trace, outcome[0])
-                    self.store.credit_keyboard_episode(
-                        self.game_id, self.keyboard_trace, outcome[0],
-                        count_outcome=not bool(recorded_mouse))
-                    if not recorded_mouse and not self.keyboard_trace and self.world_trace:
-                        self.store.record_verified_outcome(self.game_id, outcome[0])
-                    self.store.record_goal_outcome(self.game_id, self.goal_trace, outcome[0])
+                    self.store.defer_write('finish_episode', self.game_id,
+                        tuple(self.world_trace), tuple(self.episode_trace), tuple(self.keyboard_trace),
+                        tuple(self.goal_trace), tuple(self.strategy_trace), tuple(outcome))
             except sqlite3.Error as error:
                 self.store.last_error = str(error)
             self.episode_trace.clear()
@@ -9844,13 +11904,349 @@ class VisionPolicy:
             self.last_demonstration_id = None
         self.recent_states.append((next_coarse_context, fingerprint))
         self.prior = after
+        self.delayed_frame = after
         self.last_effect = effect
         ineffective = (effect < VISUAL_EFFECT_THRESHOLD or cyclic_state and not scene_transition
                        or goal_feedback is not None and
                        (goal_feedback <= -OBJECTIVE_HARM_FEEDBACK_THRESHOLD
                         or self.last_goal_progress <= GOAL_NEGATIVE_PROGRESS_TOLERANCE))
+        if verified_goal_feedback is not None and verified_goal_feedback > 0.0:
+            ineffective = False
+        if self.store is not None:
+            try:
+                self.store.calibrate(self.game_id, coarse_context, 'exploration_strength',
+                    float(ineffective), EXPLORATION_STRENGTH, source='observed_action_ineffectiveness')
+                if control is not None:
+                    self.store.calibrate(self.game_id, coarse_context, 'passive_change',
+                        counterfactual_motion, STATE_REVALIDATION_DIFFERENCE, source='pre_action_passive_frames')
+                if not ineffective and self.no_effect_steps:
+                    self.store.calibrate(self.game_id, coarse_context, 'recovery_steps',
+                                         self.no_effect_steps, RECOVERY_START_STEPS)
+                if demonstration_id is not None:
+                    self.store.calibrate(self.game_id, coarse_context, 'demonstration_chance',
+                                         float(not ineffective), DEMONSTRATION_BASE_REPLAY_CHANCE)
+                if outcome is not None:
+                    self.store.calibrate(self.game_id, coarse_context, 'td_discount',
+                                         math.exp(-1.0 / max(1, episode_length)), TD_DISCOUNT)
+            except sqlite3.Error as error:
+                self.store.last_error = str(error)
         self.no_effect_steps = self.no_effect_steps + 1 if ineffective else 0
         return reward, effect, visits
+
+
+def model_png(frame):
+    row_length = frame.width * BYTES_PER_RGB_PIXEL
+    rows = bytearray()
+    for offset in range(0, len(frame.rgb), row_length):
+        rows.append(0)
+        rows.extend(frame.rgb[offset:offset + row_length])
+
+    def chunk(tag, contents):
+        return (struct.pack(">I", len(contents)) + tag + contents
+                + struct.pack(">I", zlib.crc32(tag + contents) & C.c_uint32(-1).value))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", frame.width, frame.height,
+                                          BITS_PER_BYTE, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+class ExternalVisionAdvisor:
+    def __init__(self, stop, events):
+        self.stop = stop
+        self.events = events
+        self.closed = threading.Event()
+        self.busy = threading.Event()
+        self.inbox = queue.Queue(maxsize=1)
+        self.outbox = queue.Queue(maxsize=1)
+        self.endpoint = os.environ.get("GAME_AGENT_MODEL_URL", "").strip()
+        self.model = os.environ.get("GAME_AGENT_MODEL_NAME", "").strip()
+        self.secret = os.environ.get("GAME_AGENT_MODEL_KEY", "").strip()
+        self.provider = ""
+        self.provider_failures = 0
+        self.online_reported = False
+        self.last_warning = ""
+        self.last_warning_at = 0.0
+        self.thread = threading.Thread(target=self.run, daemon=True, name="third-party-vision-model")
+        self.thread.start()
+
+    @staticmethod
+    def get_json(url, payload=None, key=""):
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme not in ("https", "http") or not parsed.netloc
+                or parsed.username or parsed.password or parsed.fragment
+                or parsed.scheme == "http" and parsed.hostname not in ("127.0.0.1", "localhost", "::1")):
+            raise ValueError("第三方模型地址仅支持 HTTPS 或本机 HTTP")
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        headers = {"Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        if key:
+            headers["Authorization"] = "Bearer " + key
+        request = urllib.request.Request(url, data=body, headers=headers,
+                                         method="POST" if body is not None else "GET")
+        class ModelNoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, request, fp, code, msg, headers, newurl):
+                raise OSError("模型接口不允许自动跳转")
+
+        handlers = [ModelNoRedirect()]
+        if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
+            handlers.append(urllib.request.ProxyHandler({}))
+        with urllib.request.build_opener(*handlers).open(request, timeout=MODEL_HTTP_TIMEOUT_SECONDS) as response:
+            actual = urllib.parse.urlsplit(response.geturl())
+            if (actual.scheme != parsed.scheme or actual.hostname != parsed.hostname
+                    or actual.port != parsed.port):
+                raise OSError("第三方模型连接跳转到了其他地址")
+            raw = response.read(MODEL_HTTP_MAX_BYTES + 1)
+        if len(raw) > MODEL_HTTP_MAX_BYTES:
+            raise ValueError("第三方模型响应内容过大")
+        return json.loads(raw)
+
+    def find_model(self):
+        endpoint = self.endpoint or MODEL_OLLAMA_ENDPOINT
+        path = urllib.parse.urlsplit(endpoint).path.rstrip("/")
+        provider = ("ollama" if path.endswith("/api/chat") else
+                    "openai_responses" if path.endswith("/responses") else "openai")
+        if provider == "ollama":
+            root = endpoint.rsplit("/api/chat", 1)[0]
+            if self.model:
+                details = self.get_json(root + "/api/show", {"model": self.model}, self.secret)
+                capabilities = details.get("capabilities", ())
+                if capabilities and "vision" not in capabilities:
+                    raise LookupError("指定的 Ollama 模型不支持视觉输入")
+                return endpoint, self.model, provider
+            models = self.get_json(root + "/api/tags", key=self.secret).get("models", ())
+            ranked = []
+            for entry in models:
+                name = entry.get("name", "") if isinstance(entry, dict) else ""
+                if not name:
+                    continue
+                try:
+                    details = self.get_json(root + "/api/show", {"model": name}, self.secret)
+                except (OSError, ValueError, KeyError):
+                    continue
+                capabilities = details.get("capabilities", ())
+                if ("vision" in capabilities or not capabilities and
+                        any(part in name.casefold() for part in MODEL_VISION_NAME_MARKERS)):
+                    ranked.append((int("vision" in capabilities), name))
+            if ranked:
+                return endpoint, max(ranked)[1], provider
+            raise LookupError("本机 Ollama 没有可用的视觉模型")
+        if self.model:
+            return endpoint, self.model, provider
+        parsed = urllib.parse.urlsplit(endpoint)
+        root = parsed.path.rstrip("/")
+        if root.endswith("/chat/completions"):
+            root = root[:-len("/chat/completions")]
+        elif root.endswith("/responses"):
+            root = root[:-len("/responses")]
+        models_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc,
+                                              root + "/models", "", ""))
+        response = self.get_json(models_url, key=self.secret)
+        entries = response.get("data", ()) if isinstance(response, dict) else ()
+        models = sorted((entry.get("id", "") for entry in entries if isinstance(entry, dict)
+                         and any(marker in str(entry.get("id", "")).casefold()
+                                 for marker in MODEL_VISION_NAME_MARKERS)), reverse=True)
+        if models:
+            return endpoint, models[0], provider
+        raise LookupError("未发现支持图像输入的第三方模型，请通过环境变量指定模型")
+
+    @staticmethod
+    def parse(text, stop_code):
+        if not isinstance(text, str):
+            return None
+        beginning = text.find("{")
+        if beginning < 0:
+            return None
+        try:
+            result, _ = json.JSONDecoder().raw_decode(text[beginning:])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(result, dict):
+            return None
+        action = result.get("action")
+        if action not in (*MOUSE_ACTIONS, KEYBOARD_ACTION_NAME):
+            return None
+        choices = result.get("keys", ())
+        if not isinstance(choices, list):
+            return None
+        aliases = {name.casefold(): code for name, code in STOP_KEY_CODES.items()}
+        aliases.update({"escape": VK_ESCAPE, "space": VK_SPACE, "enter": VK_RETURN,
+                        "return": VK_RETURN, "backspace": VK_BACK, "control": VK_CONTROL,
+                        "left": VK_LEFT, "right": VK_RIGHT, "up": VK_UP, "down": VK_DOWN})
+        keys = []
+        for raw in choices:
+            key = (aliases.get(raw.strip().casefold()) if isinstance(raw, str)
+                   else raw if isinstance(raw, int) else None)
+            if key is None or not 1 <= key <= VK_LAST or is_stop_key(key, stop_code):
+                return None
+            if key not in keys:
+                keys.append(key)
+        if action == KEYBOARD_ACTION_NAME and not keys:
+            return None
+        if len(keys) > KEYBOARD_CHORD_MAX_KEYS:
+            return None
+        position = []
+        for field in ("x", "y", "to_x", "to_y"):
+            value = result.get(field, COORDINATE_CENTER)
+            if not isinstance(value, (float, int)) or not math.isfinite(value):
+                return None
+            position.append(min(1.0, max(0.0, float(value))))
+        duration = result.get("duration", KEYBOARD_DEFAULT_DURATION)
+        if not isinstance(duration, (int, float)) or not math.isfinite(duration):
+            return None
+        duration = max(KEYBOARD_MIN_DURATION, min(KEYBOARD_MAX_DURATION, float(duration)))
+        if action == KEYBOARD_ACTION_NAME:
+            position = [COORDINATE_CENTER] * len(position)
+        return (action, *position, tuple(keys), duration)
+
+    def warn(self, message):
+        now = time.monotonic()
+        if message != self.last_warning or now - self.last_warning_at >= MODEL_RETRY_SECONDS:
+            self.events.put(("model_status", message))
+            self.last_warning = message
+            self.last_warning_at = now
+
+    def run(self):
+        while not self.stop.is_set() and not self.closed.is_set():
+            if not self.provider:
+                try:
+                    self.endpoint, self.model, self.provider = self.find_model()
+                    self.provider_failures = 0
+                    self.events.put(("model_status", "已发现第三方视觉模型，正在验证响应：" + self.model))
+                except Exception as error:
+                    self.warn("第三方视觉模型暂不可用，使用内置学习策略：" + str(error))
+                    self.stop.wait(MODEL_RETRY_SECONDS)
+                    continue
+            try:
+                item = self.inbox.get(timeout=OBSERVER_WORKER_WAIT_SECONDS)
+            except queue.Empty:
+                continue
+            try:
+                if self.stop.is_set() or self.closed.is_set():
+                    break
+                (frame, game, coarse, objective, stop_code, requested_at,
+                 visual_signature, motion, capture_interval) = item
+                if time.monotonic() - requested_at > TEMPORAL_MAX_WINDOW_SECONDS:
+                    continue
+                picture = base64.b64encode(model_png(frame)).decode("ascii")
+                prompt = ("根据当前游戏画面自主选择下一项鼠标、键盘或组合操作，争取游戏胜利、推进进度和获得资源。"
+                          "只能返回 JSON 对象：action 为以下值之一："
+                          + ",".join((*MOUSE_ACTIONS, KEYBOARD_ACTION_NAME))
+                          + "；x、y、to_x、to_y 为 0 到 1 的屏幕相对坐标；keys 为按键名数组（可以为空），"
+                          "按键名可用 A-Z、0-9、F1-F24、Space、Enter、Shift、Ctrl、Alt、Up、Down、Left、Right 等；"
+                          "duration 为按键按下秒数。禁止使用停止键 "
+                          + next((name for name, code in STOP_KEY_CODES.items()
+                                  if code == stop_code), str(stop_code))
+                          + "。当前目标：" + str(objective) + "。只输出 JSON。")
+                if self.provider == "ollama":
+                    request = {"model": self.model, "stream": False, "format": "json",
+                               "messages": [{"role": "user", "content": prompt, "images": [picture]}]}
+                    response = self.get_json(self.endpoint, request, self.secret)
+                    content = response["message"]["content"]
+                elif self.provider == "openai_responses":
+                    request = {"model": self.model,
+                               "input": [{"role": "user", "content": [
+                                   {"type": "input_text", "text": prompt},
+                                   {"type": "input_image", "image_url": "data:image/png;base64," + picture}]}]}
+                    response = self.get_json(self.endpoint, request, self.secret)
+                    content = response.get("output_text") or "\n".join(
+                        part.get("text", "") for message in response.get("output", ())
+                        if isinstance(message, dict)
+                        for part in message.get("content", ()) if isinstance(part, dict)
+                        and part.get("type") == "output_text")
+                else:
+                    request = {"model": self.model,
+                               "messages": [{"role": "user", "content": [
+                                   {"type": "text", "text": prompt},
+                                   {"type": "image_url", "image_url": {
+                                       "url": "data:image/png;base64," + picture}}]}]}
+                    response = self.get_json(self.endpoint, request, self.secret)
+                    content = response["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    content = "\n".join(str(part.get("text", ""))
+                                        for part in content if isinstance(part, dict))
+                choice = self.parse(content, stop_code)
+                if choice is None:
+                    raise ValueError("第三方模型未返回可执行的 JSON 动作")
+                self.provider_failures = 0
+                if choice is not None and not self.closed.is_set() and not self.stop.is_set():
+                    try:
+                        self.outbox.put_nowait((game, coarse, choice, requested_at,
+                                                visual_signature, motion, capture_interval))
+                    except queue.Full:
+                        pass
+            except Exception as error:
+                self.provider_failures += 1
+                self.warn("第三方视觉模型调用失败，使用内置学习策略：" + str(error))
+                if self.provider_failures >= MODEL_FAILURE_REDISCOVERY_COUNT:
+                    self.provider = ""
+                    self.online_reported = False
+                    self.provider_failures = 0
+                    self.stop.wait(MODEL_RETRY_SECONDS)
+            finally:
+                self.busy.clear()
+
+    @staticmethod
+    def response_is_fresh(requested_at, old_signature, new_signature,
+                          old_motion, new_motion, capture_interval):
+        age = time.monotonic() - requested_at
+        if age < 0.0 or age > TEMPORAL_MAX_WINDOW_SECONDS:
+            return False
+        motion = max(0.0, old_motion, new_motion)
+        if motion >= FAST_FEEDBACK_MOTION_THRESHOLD:
+            lifetime = (max(TEMPORAL_MAX_INTERVAL_SECONDS,
+                            capture_interval * TEMPORAL_AFTER_MAX_EVALUATIONS)
+                        / (1.0 + motion / TEMPORAL_MOTION_NORMALIZER))
+            if age > lifetime:
+                return False
+        if isinstance(old_signature, (tuple, list)) and isinstance(new_signature, (tuple, list)):
+            if (len(old_signature) != len(new_signature) or
+                    len(old_signature) != MODEL_VISUAL_SIGNATURE_FIELDS or
+                    old_signature[1:] != new_signature[1:]):
+                return False
+            old_signature, new_signature = old_signature[0], new_signature[0]
+        if (not isinstance(old_signature, str) or not isinstance(new_signature, str)
+                or not old_signature or not new_signature or len(old_signature) != len(new_signature)):
+            return False
+        try:
+            distance = ((int(old_signature[:16], 16) ^ int(new_signature[:16], 16)).bit_count()
+                        + (int(old_signature[16:], 16) ^ int(new_signature[16:], 16)).bit_count())
+        except ValueError:
+            return False
+        distance /= FINGERPRINT_SIDE * FINGERPRINT_SIDE * (1 + 2)
+        return distance <= MODEL_VISUAL_MATCH_DISTANCE / (
+            1.0 + motion / TEMPORAL_MOTION_NORMALIZER)
+
+    def consult(self, frame, game, coarse, objective, stop_code,
+                visual_signature, motion=0.0, capture_interval=TEMPORAL_INITIAL_INTERVAL_SECONDS):
+        answer = None
+        while True:
+            try:
+                (response_game, response_coarse, choice, requested_at,
+                 previous_signature, previous_motion, previous_interval) = self.outbox.get_nowait()
+            except queue.Empty:
+                break
+            if (response_game == game and response_coarse == coarse
+                    and self.response_is_fresh(requested_at, previous_signature,
+                                               visual_signature, previous_motion,
+                                               motion, previous_interval)):
+                answer = choice
+        if answer is not None and not self.online_reported:
+            self.online_reported = True
+            self.events.put(("model_status", "第三方视觉模型已提供有效候选动作：" + self.model))
+        if not self.busy.is_set() and not self.stop.is_set():
+            self.busy.set()
+            try:
+                self.inbox.put_nowait((frame, game, coarse, objective, stop_code,
+                                       time.monotonic(), visual_signature,
+                                       motion, capture_interval))
+            except queue.Full:
+                self.busy.clear()
+        return answer
+
+    def close(self):
+        self.closed.set()
 
 
 class MouseInput(C.Structure):
@@ -9931,6 +12327,8 @@ class Native:
             (self.user, "EnumWindows", C.c_int, [self.window_enum_type, C.c_ssize_t]),
             (self.user, "GetWindow", C.c_void_p, [C.c_void_p, C.c_uint]),
             (self.user, "GetAncestor", C.c_void_p, [C.c_void_p, C.c_uint]),
+            (self.user, "GetLastActivePopup", C.c_void_p, [C.c_void_p]),
+            (self.user, "IsWindowEnabled", C.c_int, [C.c_void_p]),
             (self.user, "GetWindowTextLengthW", C.c_int, [C.c_void_p]),
             (self.user, "GetWindowTextW", C.c_int, [C.c_void_p, C.c_wchar_p, C.c_int]),
             (self.user, "GetClassNameW", C.c_int, [C.c_void_p, C.c_wchar_p, C.c_int]),
@@ -9943,6 +12341,8 @@ class Native:
             (self.user, "ShowWindow", C.c_int, [C.c_void_p, C.c_int]),
             (self.user, "SetForegroundWindow", C.c_int, [C.c_void_p]),
             (self.user, "GetDC", C.c_void_p, [C.c_void_p]),
+            (self.user, "PrintWindow", C.c_int, [C.c_void_p, C.c_void_p, C.c_uint]),
+            (self.user, "IsHungAppWindow", C.c_int, [C.c_void_p]),
             (self.user, "ReleaseDC", C.c_int, [C.c_void_p, C.c_void_p]),
             (self.user, "SendInput", C.c_uint, [C.c_uint, C.POINTER(Input), C.c_int]),
             (self.user, "MapVirtualKeyW", C.c_uint32, [C.c_uint32, C.c_uint32]),
@@ -9962,6 +12362,7 @@ class Native:
             (self.gdi, "DeleteDC", C.c_int, [C.c_void_p]),
             (self.gdi, "SetStretchBltMode", C.c_int, [C.c_void_p, C.c_int]),
             (self.gdi, "StretchBlt", C.c_int, [C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int, C.c_uint32]),
+            (self.gdi, "BitBlt", C.c_int, [C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_uint32]),
             (self.gdi, "GetDIBits", C.c_int, [C.c_void_p, C.c_void_p, C.c_uint, C.c_uint, C.c_void_p, C.POINTER(BitmapHeader), C.c_uint]),
             (self.kernel, "GetModuleHandleW", C.c_void_p, [C.c_wchar_p]),
             (self.kernel, "OpenProcess", C.c_void_p, [C.c_uint32, C.c_int, C.c_uint32]),
@@ -9990,6 +12391,14 @@ class Native:
         self.cpu_sample = None
         self.semantic_text_lock = threading.RLock()
         self.semantic_text_spotter = None
+        self.game_identity_cache = collections.OrderedDict()
+        self.game_identity_lock = threading.RLock()
+        self.capture_history_lock = threading.RLock()
+        self.capture_history = collections.OrderedDict()
+        self.capture_fallback_thread = None
+        self.capture_fallback_result = None
+        self.capture_fallback_requests = collections.OrderedDict()
+        self.last_input_time = 0.0
 
     def hardware_state(self):
         memory = MemoryStatus()
@@ -10105,6 +12514,9 @@ class Native:
     def game_id(self, hwnd):
         if not hwnd:
             return "desktop"
+        root = self.user.GetAncestor(hwnd, GA_ROOTOWNER)
+        if root and self.window_owner(root) is not None:
+            hwnd = root
         process = C.c_uint32()
         self.user.GetWindowThreadProcessId(hwnd, C.byref(process))
         executable = ""
@@ -10117,14 +12529,32 @@ class Native:
                     executable = str(Path(buffer.value)).lower()
             finally:
                 self.kernel.CloseHandle(handle)
-        caption = re.sub(r"\d+", "#", self.window_caption(hwnd).casefold().strip())[:GAME_TITLE_ID_LENGTH]
+        caption = self.window_caption(hwnd).casefold().strip()
+        caption = re.sub(r"\b(?:\d+[/:.-]){1,}\d+\b", "#", caption)
+        caption = re.sub(r"\d+", "#", caption)
+        caption = re.sub(r"(?:\s*[-|—]\s*(?:google chrome|microsoft edge|mozilla firefox|brave|opera))+$", "", caption)
+        caption = re.sub(r"\s+", " ", caption)[:GAME_TITLE_ID_LENGTH]
         executable_name = Path(executable).name if executable else ""
         window_class = self.window_class(hwnd)
         if executable_name and executable_name not in SHARED_HOST_EXECUTABLES:
             identity = (executable_name, window_class)
         else:
             identity = (executable_name, window_class, caption)
-        return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:GAME_ID_LENGTH]
+        candidate = hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:GAME_ID_LENGTH]
+        cache_key = (hwnd, process.value, executable_name, window_class)
+        with self.game_identity_lock:
+            cached = self.game_identity_cache.get(cache_key)
+            if cached is not None and (not executable_name or executable_name in SHARED_HOST_EXECUTABLES):
+                old_title, previous = cached
+                if (not caption or caption == old_title or
+                        old_title and difflib.SequenceMatcher(None, old_title, caption).ratio()
+                        >= GAME_TITLE_STABILITY_SIMILARITY):
+                    candidate = previous
+            self.game_identity_cache[cache_key] = caption, candidate
+            self.game_identity_cache.move_to_end(cache_key)
+            while len(self.game_identity_cache) > GAME_IDENTITY_CACHE_ENTRIES:
+                self.game_identity_cache.popitem(last=False)
+        return candidate
 
     def foreground_window(self, own_hwnd=None):
         handle = self.user.GetForegroundWindow()
@@ -10141,6 +12571,44 @@ class Native:
             handle = self.user.GetWindow(handle, GW_HWNDNEXT)
         return None, None
 
+    def foreground_identity(self):
+        hwnd = self.user.GetForegroundWindow()
+        return hwnd, self.window_owner(hwnd)
+
+    def same_window_family(self, first, second):
+        if not first or not second:
+            return False
+        first_root = self.user.GetAncestor(first, GA_ROOTOWNER) or first
+        second_root = self.user.GetAncestor(second, GA_ROOTOWNER) or second
+        return (first_root == second_root and
+                self.window_owner(first_root) is not None and
+                self.window_owner(first_root) == self.window_owner(second_root))
+
+    def interaction_window(self, hwnd):
+        if not hwnd or not self.user.IsWindow(hwnd):
+            return None
+        root = self.user.GetAncestor(hwnd, GA_ROOTOWNER) or hwnd
+        foreground = self.user.GetForegroundWindow()
+        if (self.same_window_family(root, foreground) and
+                self.user.IsWindowEnabled(foreground) and
+                self.window_bounds(foreground) is not None):
+            return foreground
+        candidate = root
+        visited = set()
+        while candidate and candidate not in visited:
+            visited.add(candidate)
+            popup = self.user.GetLastActivePopup(candidate)
+            if not popup or popup == candidate:
+                break
+            if not self.same_window_family(root, popup):
+                break
+            candidate = popup
+        for target in (candidate, hwnd, root):
+            if (self.user.IsWindowEnabled(target) and
+                    self.window_bounds(target) is not None):
+                return target
+        return hwnd
+
     def target_is_foreground(self, hwnd):
         foreground = self.user.GetForegroundWindow()
         if not hwnd or not foreground:
@@ -10156,18 +12624,171 @@ class Native:
             return self.target_is_foreground(hwnd)
         return False
 
-    def capture(self, area=None, long_edge=VISION_LONG_EDGE):
+    @staticmethod
+    def capture_detail(raw):
+        if not raw:
+            return 0
+        step = max(BYTES_PER_COLOR_PIXEL,
+                   (len(raw) // (CAPTURE_DETAIL_SAMPLE_BUDGET * BYTES_PER_COLOR_PIXEL))
+                   * BYTES_PER_COLOR_PIXEL)
+        minimum = COLOR_MAX
+        maximum = 0
+        for offset in range(0, len(raw) - BYTES_PER_COLOR_PIXEL + 1, step):
+            minimum = min(minimum, *raw[offset:offset + BYTES_PER_RGB_PIXEL])
+            maximum = max(maximum, *raw[offset:offset + BYTES_PER_RGB_PIXEL])
+        return maximum - minimum
+
+    def capture_stale(self, window, area, raw):
+        now = time.monotonic()
+        step = max(BYTES_PER_COLOR_PIXEL,
+                   (len(raw) // (CAPTURE_DETAIL_SAMPLE_BUDGET * BYTES_PER_COLOR_PIXEL))
+                   * BYTES_PER_COLOR_PIXEL)
+        signature = hashlib.blake2s(raw[::step], digest_size=GAME_ID_LENGTH // 2).digest()
+        key = window, area
+        with self.capture_history_lock:
+            previous = self.capture_history.get(key)
+            if previous is not None and previous[0] == signature:
+                first_seen, last_input = previous[1:]
+                stale = (now - first_seen >= CAPTURE_FALLBACK_MAX_AGE_SECONDS
+                         and self.last_input_time > last_input)
+            else:
+                first_seen = now
+                last_input = self.last_input_time
+                stale = False
+            self.capture_history[key] = signature, first_seen, last_input
+            self.capture_history.move_to_end(key)
+            while len(self.capture_history) > CAPTURE_HISTORY_ENTRIES:
+                self.capture_history.popitem(last=False)
+            return stale
+
+    def bitmap_pixels(self, dc, bitmap, width, height):
+        header = BitmapHeader()
+        header.biSize = C.sizeof(header)
+        header.biWidth = width
+        header.biHeight = -height
+        header.biPlanes = 1
+        header.biBitCount = BITS_PER_BYTE * BYTES_PER_COLOR_PIXEL
+        header.biCompression = BI_RGB
+        pixels = C.create_string_buffer(width * height * BYTES_PER_COLOR_PIXEL)
+        if self.gdi.GetDIBits(dc, bitmap, 0, height, pixels, C.byref(header), DIB_RGB_COLORS) != height:
+            raise C.WinError(C.get_last_error())
+        return pixels.raw
+
+    def printwindow_pixels(self, window, area, width, height):
+        if (not window or self.window_bounds(window) != area or
+                self.user.IsHungAppWindow(window)):
+            return None
+        rectangle = WinRect()
+        origin = WinPoint()
+        if (not self.user.GetClientRect(window, C.byref(rectangle)) or
+                not self.user.ClientToScreen(window, C.byref(origin))):
+            return None
+        client_width = rectangle.right - rectangle.left
+        client_height = rectangle.bottom - rectangle.top
+        if client_width <= 0 or client_height <= 0:
+            return None
+        screen = self.user.GetDC(None)
+        original_dc = target_dc = original_bitmap = target_bitmap = None
+        original_selected = target_selected = None
+        try:
+            if not screen:
+                return None
+            original_dc = self.gdi.CreateCompatibleDC(screen)
+            target_dc = self.gdi.CreateCompatibleDC(screen)
+            if not original_dc or not target_dc:
+                return None
+            original_bitmap = self.gdi.CreateCompatibleBitmap(screen, client_width, client_height)
+            target_bitmap = self.gdi.CreateCompatibleBitmap(screen, width, height)
+            if not original_bitmap or not target_bitmap:
+                return None
+            original_selected = self.gdi.SelectObject(original_dc, original_bitmap)
+            target_selected = self.gdi.SelectObject(target_dc, target_bitmap)
+            if (not original_selected or original_selected == C.c_void_p(-1).value or
+                    not target_selected or target_selected == C.c_void_p(-1).value):
+                return None
+            if (not self.user.PrintWindow(window, original_dc, PW_CLIENTONLY | PW_RENDERFULLCONTENT)
+                    and not self.user.PrintWindow(window, original_dc, PW_CLIENTONLY)):
+                return None
+            self.gdi.SetStretchBltMode(target_dc, COLORONCOLOR)
+            x, y, capture_width, capture_height = area
+            if not self.gdi.StretchBlt(target_dc, 0, 0, width, height, original_dc,
+                                      x - origin.x, y - origin.y,
+                                      capture_width, capture_height, SRCCOPY):
+                return None
+            self.gdi.SelectObject(target_dc, target_selected)
+            target_selected = None
+            return self.bitmap_pixels(target_dc, target_bitmap, width, height)
+        finally:
+            if original_selected and original_dc:
+                self.gdi.SelectObject(original_dc, original_selected)
+            if target_selected and target_dc:
+                self.gdi.SelectObject(target_dc, target_selected)
+            if original_bitmap:
+                self.gdi.DeleteObject(original_bitmap)
+            if target_bitmap:
+                self.gdi.DeleteObject(target_bitmap)
+            if original_dc:
+                self.gdi.DeleteDC(original_dc)
+            if target_dc:
+                self.gdi.DeleteDC(target_dc)
+            if screen:
+                self.user.ReleaseDC(None, screen)
+
+    def alternate_capture(self, window, area, width, height):
+        key = (window, area, width, height)
+        now = time.monotonic()
+        with self.capture_history_lock:
+            current = self.capture_fallback_thread
+            if current is not None and not current.is_alive():
+                completed = self.capture_fallback_result
+                self.capture_fallback_result = None
+                self.capture_fallback_thread = None
+                if (completed is not None and completed[0] == key and
+                        now - completed[1] <= CAPTURE_FALLBACK_MAX_AGE_SECONDS):
+                    return completed[2]
+            elif current is not None:
+                return None
+            if now - self.capture_fallback_requests.get(key, -CAPTURE_FALLBACK_RETRY_SECONDS) < CAPTURE_FALLBACK_RETRY_SECONDS:
+                return None
+            self.capture_fallback_requests[key] = now
+            self.capture_fallback_requests.move_to_end(key)
+            while len(self.capture_fallback_requests) > CAPTURE_HISTORY_ENTRIES:
+                self.capture_fallback_requests.popitem(last=False)
+
+            def work():
+                try:
+                    pixels = self.printwindow_pixels(window, area, width, height)
+                except (OSError, MemoryError, ValueError):
+                    pixels = None
+                with self.capture_history_lock:
+                    self.capture_fallback_result = key, time.monotonic(), pixels
+
+            current = threading.Thread(target=work, daemon=True,
+                                       name="window-capture-fallback")
+            self.capture_fallback_thread = current
+            current.start()
+        current.join(timeout=CAPTURE_FALLBACK_TIMEOUT_SECONDS)
+        if current.is_alive():
+            return None
+        with self.capture_history_lock:
+            completed = self.capture_fallback_result
+            self.capture_fallback_result = None
+            self.capture_fallback_thread = None
+        return completed[2] if completed is not None and completed[0] == key else None
+
+    def capture(self, area=None, long_edge=VISION_LONG_EDGE, window=None):
         x, y, screen_width, screen_height = area if area is not None else self.bounds()
         if min(screen_width, screen_height) <= 0:
             raise OSError("屏幕当前不可捕获")
-        ratio = min(1.0, min(long_edge, VISION_ADAPTIVE_MAX_EDGE) / max(screen_width, screen_height))
-        ratio = min(ratio, math.sqrt(VISION_MAX_CAPTURE_PIXELS / (screen_width * screen_height)))
+        ratio = min(1.0, max(VISION_MIN_EDGE, long_edge) / max(screen_width, screen_height))
         width = min(screen_width, max(VISION_MIN_EDGE, round(screen_width * ratio)))
         height = min(screen_height, max(VISION_MIN_EDGE, round(screen_height * ratio)))
         screen = self.user.GetDC(None)
         memory = None
         bitmap = None
         selected = None
+        raw = None
+        failure = None
         try:
             if not screen:
                 raise C.WinError(C.get_last_error())
@@ -10181,22 +12802,39 @@ class Native:
             if not selected or selected == C.c_void_p(-1).value:
                 raise C.WinError(C.get_last_error())
             self.gdi.SetStretchBltMode(memory, COLORONCOLOR)
-            if not self.gdi.StretchBlt(memory, 0, 0, width, height, screen, x, y, screen_width, screen_height, SRCCOPY | CAPTUREBLT):
-                if not self.gdi.StretchBlt(memory, 0, 0, width, height, screen, x, y, screen_width, screen_height, SRCCOPY):
-                    raise C.WinError(C.get_last_error())
-            self.gdi.SelectObject(memory, selected)
-            selected = None
-            header = BitmapHeader()
-            header.biSize = C.sizeof(header)
-            header.biWidth = width
-            header.biHeight = -height
-            header.biPlanes = 1
-            header.biBitCount = BITS_PER_BYTE * BYTES_PER_COLOR_PIXEL
-            header.biCompression = BI_RGB
-            pixels = C.create_string_buffer(width * height * BYTES_PER_COLOR_PIXEL)
-            if self.gdi.GetDIBits(memory, bitmap, 0, height, pixels, C.byref(header), DIB_RGB_COLORS) != height:
-                raise C.WinError(C.get_last_error())
-            raw = pixels.raw
+            succeeded = self.gdi.StretchBlt(memory, 0, 0, width, height, screen,
+                                            x, y, screen_width, screen_height, SRCCOPY | CAPTUREBLT)
+            if not succeeded:
+                succeeded = self.gdi.StretchBlt(memory, 0, 0, width, height, screen,
+                                                x, y, screen_width, screen_height, SRCCOPY)
+            if not succeeded and width == screen_width and height == screen_height:
+                succeeded = self.gdi.BitBlt(memory, 0, 0, width, height, screen, x, y, SRCCOPY)
+            if succeeded:
+                self.gdi.SelectObject(memory, selected)
+                selected = None
+                try:
+                    raw = self.bitmap_pixels(memory, bitmap, width, height)
+                except OSError as error:
+                    failure = error
+            else:
+                failure = C.WinError(C.get_last_error())
+            if window is None:
+                foreground = self.user.GetForegroundWindow()
+                if foreground and self.window_bounds(foreground) == (x, y, screen_width, screen_height):
+                    window = foreground
+            detail = self.capture_detail(raw)
+            stale = (self.capture_stale(window, (x, y, screen_width, screen_height), raw)
+                     if window is not None and raw is not None else False)
+            if window is not None and (raw is None or detail < CAPTURE_DETAIL_MIN_RANGE or stale):
+                alternative = self.alternate_capture(window, (x, y, screen_width, screen_height), width, height)
+                alternate_detail = self.capture_detail(alternative)
+                if (alternative is not None and (raw is None or
+                        detail < CAPTURE_DETAIL_MIN_RANGE and alternate_detail > CAPTURE_DETAIL_MIN_RANGE or
+                        stale and alternate_detail >= max(detail, CAPTURE_DETAIL_MIN_RANGE) and
+                        alternative != raw)):
+                    raw = alternative
+            if raw is None:
+                raise failure if failure is not None else OSError("无法从目标区域读取画面")
             numpy = NUMPY_ACCELERATOR
             if numpy is not None:
                 with numpy_operation():
@@ -10256,10 +12894,11 @@ class Native:
         packet.mi = MouseInput(x, y, data & C.c_uint32(-1).value, flags, 0, 0)
         if self.user.SendInput(1, C.byref(packet), C.sizeof(packet)) != 1:
             raise OSError(f"Windows 拒绝模拟鼠标输入（Win32 错误 {C.get_last_error()}）：权限、受保护桌面或游戏输入限制")
+        self.last_input_time = time.monotonic()
 
     def send_key(self, key, release=False):
-        if not release and is_stop_key(key, self.forbidden_key):
-            raise ValueError("不能模拟用户设置的停止键")
+        if is_stop_key(key, self.forbidden_key):
+            raise ValueError("不能模拟或释放用户设置的停止键")
         if not release and self.active_target_window:
             if (self.active_target_owner is not None
                     and self.window_owner(self.active_target_window) != self.active_target_owner):
@@ -10277,6 +12916,7 @@ class Native:
             packet.ki = KeyboardInput(key, 0, flags, 0, 0)
         if self.user.SendInput(1, C.byref(packet), C.sizeof(packet)) != 1:
             raise OSError(f"Windows 拒绝模拟键盘输入（Win32 错误 {C.get_last_error()}）")
+        self.last_input_time = time.monotonic()
 
     def keyboard_action(self, keys, duration, stop, during=None):
         keys = tuple(dict.fromkeys(keys))
@@ -10388,7 +13028,11 @@ class Native:
             area = self.window_bounds(self.active_target_window)
             if area is None:
                 raise OSError("目标游戏窗口已不可用，已阻止鼠标越界")
-        _, _, width, height = area if area is not None else self.bounds()
+        left, top, width, height = area if area is not None else self.bounds()
+        point = WinPoint()
+        if (self.active_target_window and self.user.GetCursorPos(C.byref(point)) and
+                not (left <= point.x < left + width and top <= point.y < top + height)):
+            self.move(COORDINATE_CENTER, COORDINATE_CENTER, stop, area)
         dx = round((x - COORDINATE_CENTER) * width * RELATIVE_MOUSE_REACH)
         dy = round((y - COORDINATE_CENTER) * height * RELATIVE_MOUSE_REACH)
         with self.io_lock:
@@ -10451,7 +13095,11 @@ class Native:
         self.move(x, y, stop, area)
         if stop.is_set():
             return
-        _, _, width, height = area if area is not None else self.bounds()
+        left, top, width, height = area if area is not None else self.bounds()
+        point = WinPoint()
+        if (self.active_target_window and self.user.GetCursorPos(C.byref(point)) and
+                not (left <= point.x < left + width and top <= point.y < top + height)):
+            self.move(COORDINATE_CENTER, COORDINATE_CENTER, stop, area)
         dx = round((to_x - x) * width * RELATIVE_MOUSE_REACH)
         dy = round((to_y - y) * height * RELATIVE_MOUSE_REACH)
         down, up = ((MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP) if name == "左按相对移动" else (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP))
@@ -10601,8 +13249,16 @@ class KeyboardGuard:
         self.lock = threading.RLock()
         self.pressed = set()
         self.stop_key = None
+        self.release_requested = threading.Event()
+        self.stopped_at = None
         self.thread = threading.Thread(target=self.run, daemon=True, name="keyboard-stop-guard")
         self.thread.start()
+
+    def signal_stop(self):
+        if not self.stop.is_set():
+            self.stopped_at = time.monotonic()
+        self.stop.set()
+        self.release_requested.set()
 
     def run(self):
         user = self.native.user
@@ -10616,11 +13272,12 @@ class KeyboardGuard:
                             if self.armed.is_set() and key is not None and is_stop_key(record.vkCode, key):
                                 if message in (WM_KEYUP, WM_SYSKEYUP):
                                     if key == VK_SNAPSHOT and key not in self.pressed:
-                                        self.stop.set()
+                                        self.signal_stop()
                                     self.pressed.discard(key)
                                 elif key not in self.pressed:
                                     self.pressed.add(key)
-                                    self.stop.set()
+                                    self.signal_stop()
+                                return 1
             except Exception as error:
                 self.error = str(error)
             return user.CallNextHookEx(None, code, message, data)
@@ -10643,12 +13300,18 @@ class KeyboardGuard:
                         state = user.GetAsyncKeyState(key)
                         if state & KEY_DOWN_MASK:
                             if key not in self.pressed:
-                                self.stop.set()
+                                self.signal_stop()
                             self.pressed.add(key)
                         else:
                             self.pressed.discard(key)
-                            if not self.hook_installed and state & KEY_PRESSED_MASK:
-                                self.stop.set()
+                            if state & KEY_PRESSED_MASK and key not in self.pressed:
+                                self.signal_stop()
+                if self.release_requested.is_set():
+                    self.release_requested.clear()
+                    try:
+                        self.native.release()
+                    except OSError as error:
+                        self.error = str(error)
                 self.close_event.wait(KEYBOARD_POLL_SECONDS)
         finally:
             if hook:
@@ -10663,7 +13326,9 @@ class KeyboardGuard:
             current_state = self.native.user.GetAsyncKeyState(key)
             self.pressed = ({key} if current_state & KEY_DOWN_MASK else set())
             if reset_stop:
+                self.stopped_at = None
                 self.stop.clear()
+            self.release_requested.clear()
             self.armed.set()
 
 
@@ -10671,7 +13336,7 @@ class KeyboardGuard:
 class KeyboardActionLearner:
     def __init__(self, store):
         self.store = store
-        self.rng = random.Random()
+        self.rng = store.random_stream(type(self).__name__) if store is not None else random.Random(STATE_ENCODING_VERSION)
         self.previous_game = None
         self.previous_chord = ''
 
@@ -10686,7 +13351,7 @@ class KeyboardActionLearner:
 
     @staticmethod
     def conflicting_chords(history):
-        conflicts = {frozenset(pair) for pair in KEYBOARD_CONFLICTING_PAIRS}
+        conflicts = set()
         for chord, (count, reward, effect, goal_n, goal, episode_n, episode) in history.items():
             keys = KeyboardActionLearner.chord(chord)
             if len(keys) != 2 or count < KEYBOARD_COMBINATION_MIN_SAMPLES:
@@ -10701,9 +13366,8 @@ class KeyboardActionLearner:
         return conflicts
 
     @staticmethod
-    def candidate_valid(keys, forbidden, conflicts):
-        return (bool(keys) and not any(is_stop_key(key, forbidden) for key in keys)
-                and all(not pair.issubset(keys) for pair in conflicts))
+    def candidate_valid(keys, forbidden):
+        return bool(keys) and not any(is_stop_key(key, forbidden) for key in keys)
 
     def observed(self, game, coarse, keys, reward, effect, goal_feedback, outcome):
         chord = ','.join(map(str, sorted(set(keys)))) if keys else ''
@@ -10757,7 +13421,7 @@ class KeyboardActionLearner:
         demonstrations = []
         for signature, video_signature, code, chord, next_signature, count, effect, duration in examples:
             keys = self.chord(chord) or (code,)
-            if not self.candidate_valid(keys, forbidden, conflicts):
+            if not self.candidate_valid(keys, forbidden):
                 continue
             distance = policy.fingerprint_distance(fingerprint, signature)
             if distance is None or distance > KEYBOARD_MATCH_DISTANCE:
@@ -10785,6 +13449,13 @@ class KeyboardActionLearner:
                   ("planning", "strategy", "demonstration", "causal_skill") else KEYBOARD_ACTION_RATE)
         chance += KEYBOARD_STAGNATION_RATE * min(1.0,
                   policy.no_effect_steps / KEYBOARD_STAGNATION_SCALE)
+        if policy.local_budget is not None:
+            performance = policy.local_budget.telemetry()
+            ineffective = performance.get('no_effect_ema')
+            if ineffective is not None:
+                chance += KEYBOARD_STAGNATION_RATE * ineffective
+            if performance.get('observed_compute_load', 0.0) > TEMPORAL_COMPUTE_INTERVAL_SHARE:
+                chance *= TEMPORAL_CPU_SPARE_THRESHOLD
         competent = [(row[0], row[2] / row[0]) for row in history.values()
                      if row[0] >= KEYBOARD_NO_EFFECT_MIN_EXAMPLES]
         if competent and max(value for _, value in competent) >= KEYBOARD_COMPETENT_EFFECT:
@@ -10795,13 +13466,13 @@ class KeyboardActionLearner:
             return None
         candidates = {tuple(sorted(set(keys))): self.duration(keys)
                       for keys in KEYBOARD_EXPLORATION_CHORDS
-                      if self.candidate_valid(keys, forbidden, conflicts)}
+                      if self.candidate_valid(keys, forbidden)}
         for _, keys, duration in demonstrations:
             candidates[keys] = duration
         for available in (history, transfer):
             for chord in available:
                 keys = self.chord(chord)
-                if self.candidate_valid(keys, forbidden, conflicts):
+                if self.candidate_valid(keys, forbidden):
                     candidates.setdefault(keys, self.duration(keys))
         seeds = []
         for chord, (n, reward, effect, gn, goal, en, episode) in history.items():
@@ -10821,13 +13492,13 @@ class KeyboardActionLearner:
                 if pair_count >= KEYBOARD_COMBINATION_MAX_PAIRS:
                     break
                 keys = tuple(sorted((first, second)))
-                if self.candidate_valid(keys, forbidden, conflicts):
+                if self.candidate_valid(keys, forbidden):
                     candidates.setdefault(keys, self.duration(keys))
                     pair_count += 1
         for modifier in KEYBOARD_MODIFIER_SEEDS:
             for key in seeds:
                 keys = tuple(sorted(set((modifier, key))))
-                if self.candidate_valid(keys, forbidden, conflicts):
+                if self.candidate_valid(keys, forbidden):
                     candidates.setdefault(keys, self.duration(keys))
         total = sum(row[0] for row in history.values())
         scores = []
@@ -10875,11 +13546,37 @@ class KeyboardActionLearner:
                     + KEYBOARD_EPISODE_WEIGHT * (sw - sl)) / (sn + KEYBOARD_SEQUENCE_PRIOR)
             score += (KEYBOARD_INITIAL_PRIOR_GAIN * KEYBOARD_INITIAL_CHORD_PRIORS.get(keys, 0.0)
                       / math.sqrt(n + 1))
+            if any(pair.issubset(keys) for pair in conflicts):
+                score -= KEYBOARD_NO_EFFECT_PENALTY / math.sqrt(n + 1)
             score += self.rng.random() * KEYBOARD_RANDOM_TIE
             scores.append((score, keys, self.adaptive_duration(
                 policy.game_id, coarse, keys, durations)))
         if not scores:
             return None
+        predictor = policy.predictor
+        if (predictor is not None and predictor.readiness()
+                and policy.semantic_scene.objects):
+            entity = max(policy.semantic_scene.objects,
+                         key=lambda obj: (obj.concept_confidence, obj.area))
+            likely = sorted(scores, reverse=True)[:NEURAL_MAX_CANDIDATE_ACTIONS]
+            neural_scores = {}
+            experience = (predictor.local_model.goal_samples / (
+                predictor.local_model.goal_samples + NEURAL_MIN_GOAL_EXAMPLES))
+            for _, keys, duration in likely:
+                predicted = predictor.predict(
+                    entity, KEYBOARD_ACTION_NAME, policy.director.active,
+                    keys=keys, duration=duration)
+                if predicted is None:
+                    continue
+                expected_goal, expected_effect, uncertainty = predicted
+                neural_scores[keys] = (
+                    (NEURAL_CONTROL_PREDICTION_GAIN * expected_goal
+                     * (NEURAL_GLOBAL_BLEND + (1.0 - NEURAL_GLOBAL_BLEND) * experience)
+                     if predictor.goal_ready() else 0.0)
+                    + NEURAL_EFFECT_GAIN * expected_effect
+                    + NEURAL_UNCERTAINTY_GAIN * uncertainty)
+            scores = [(score + neural_scores.get(keys, 0.0), keys, duration)
+                      for score, keys, duration in scores]
         _, keys, duration = max(scores)
         return keys, duration, "键盘探索"
 
@@ -10887,7 +13584,7 @@ class KeyboardActionLearner:
 class ControlArbiter:
     def __init__(self, store):
         self.store = store
-        self.rng = random.Random()
+        self.rng = store.random_stream(type(self).__name__) if store is not None else random.Random(STATE_ENCODING_VERSION)
 
     @staticmethod
     def mode_value(record, prior):
@@ -10921,8 +13618,12 @@ class ControlArbiter:
             estimate = self.mode_value(local, CONTROL_MODE_PRIOR)
             estimate += (CONTROL_MODE_GLOBAL_WEIGHT * global_value
                          * CONTROL_MODE_PRIOR / (n + CONTROL_MODE_PRIOR))
+            observed = n + CONTROL_MODE_GLOBAL_WEIGHT * general[0]
+            ineffective = ((local[7] + CONTROL_MODE_GLOBAL_WEIGHT * general[7])
+                           / (observed + CONTROL_MODE_PRIOR))
             explore = (CONTROL_MODE_EXPLORATION * (1.0 + CONTROL_MODE_STAGNATION_GAIN * stagnant)
-                       * math.sqrt(math.log(total + len(CONTROL_MODES) + 1) / (n + 1)))
+                       * math.sqrt(math.log(total + len(CONTROL_MODES) + 1) / (n + 1))
+                       * max(0.0, 1.0 - CONTROL_MODE_STAGNATION_GAIN * ineffective))
             if total < CONTROL_MODE_CONTEXT_MIN_COUNT:
                 explore += CONTROL_MODE_GLOBAL_WEIGHT * math.sqrt(
                     math.log(global_total + len(CONTROL_MODES) + 1) / (general[0] + 1))
@@ -10932,8 +13633,49 @@ class ControlArbiter:
                 estimate += CONTROL_MODE_PLAN_BONUS / math.sqrt(n + 1)
             if keyboard_choice[2] == "键盘示范" and mode in ('keyboard', 'joint'):
                 estimate += CONTROL_MODE_DEMO_BONUS / math.sqrt(n + 1)
+            if (policy.predictor is not None and policy.predictor.readiness()
+                    and policy.semantic_scene.objects):
+                target = max(policy.semantic_scene.objects,
+                             key=lambda entity: (entity.concept_confidence, entity.area))
+                candidate_action = (KEYBOARD_ACTION_NAME if mode == 'keyboard'
+                                    else policy.last_action)
+                candidate_keys = keyboard_choice[0] if mode in ('keyboard', 'joint') else ()
+                if candidate_action in (*MOUSE_ACTIONS, KEYBOARD_ACTION_NAME):
+                    expected = policy.predictor.predict(
+                        target, candidate_action, policy.director.active,
+                        keys=candidate_keys,
+                        duration=keyboard_choice[1] if candidate_keys else None)
+                    if expected is not None:
+                        experience = (policy.predictor.local_model.goal_samples
+                                      / (policy.predictor.local_model.goal_samples
+                                         + NEURAL_MIN_GOAL_EXAMPLES))
+                        if policy.predictor.goal_ready():
+                            estimate += (NEURAL_CONTROL_PREDICTION_GAIN * expected[0]
+                                         * (NEURAL_GLOBAL_BLEND +
+                                            (1.0 - NEURAL_GLOBAL_BLEND) * experience))
+                        estimate += NEURAL_EFFECT_GAIN * expected[1]
+            candidate_action = KEYBOARD_ACTION_NAME if mode == 'keyboard' else policy.last_action
+            candidate_keys = keyboard_choice[0] if mode in ('keyboard', 'joint') else ()
+            estimate -= policy.recovery_penalty(coarse, policy.last_cell, policy.last_spot,
+                                                candidate_action, candidate_keys)
             scores[mode] = estimate + self.rng.random() * CONTROL_MODE_RANDOM_NOISE
         return max(scores, key=scores.__getitem__)
+
+    def refine(self, policy, context, action, cell, spot, keys, demonstration_id=None):
+        original = 'keyboard' if action == KEYBOARD_ACTION_NAME else 'joint' if keys else 'mouse'
+        if original != 'joint':
+            return original
+        alternatives = [('joint', action, keys, demonstration_id),
+                        ('mouse', action, (), demonstration_id),
+                        ('keyboard', KEYBOARD_ACTION_NAME, keys, None)]
+        costs = {mode: policy.control_penalty(context, cell, spot, candidate, chord, example)
+                 for mode, candidate, chord, example in alternatives}
+        if costs[original] <= min(costs.values()):
+            return original
+        best = min(costs.values())
+        modes = list(costs)
+        weights = [math.exp(best - costs[mode]) for mode in modes]
+        return self.rng.choices(modes, weights=weights, k=1)[0]
 
     @staticmethod
     def joint_value(row):
@@ -10956,7 +13698,7 @@ class ControlArbiter:
             keys = KeyboardActionLearner.chord(chord)
             if not keys or any(is_stop_key(key, forbidden) for key in keys):
                 continue
-            score = self.joint_value(row)
+            score = self.joint_value(row) - policy.recovery_penalty(coarse, cell, spot, action, keys)
             if context == '*':
                 score *= CONTROL_JOINT_GLOBAL_BACKOFF
             else:
@@ -10991,9 +13733,11 @@ class PassiveMouseObserver:
         self.video_budget = VideoBudget(self.native)
         self.pressed = {}
         self.pressed_keys = {}
+        self.keyboard_segment = None
         self.keyboard_overlaps = set()
         self.poll_keys = {}
         self.keyboard_hook_installed = False
+        self.last_keyboard_hook_input = 0.0
         self.last_training_time = 0.0
         self.pending_click = None
         self.pending = []
@@ -11086,7 +13830,10 @@ class PassiveMouseObserver:
                     if not event.flags & LLKHF_INJECTED:
                         point = WinPoint()
                         user.GetCursorPos(C.byref(point))
-                        self.enqueue(time.monotonic(), message, point.x, point.y,
+                        now = time.monotonic()
+                        self.last_keyboard_hook_input = now
+                        self.poll_keys[event.vkCode] = message in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                        self.enqueue(now, message, point.x, point.y,
                                      event.vkCode, user.GetForegroundWindow())
             except Exception:
                 pass
@@ -11172,6 +13919,7 @@ class PassiveMouseObserver:
         self.samples.clear()
         self.pressed.clear()
         self.pressed_keys.clear()
+        self.keyboard_segment = None
         self.keyboard_overlaps.clear()
         self.poll_keys.clear()
         self.pending.clear()
@@ -11266,6 +14014,29 @@ class PassiveMouseObserver:
             self.submit(start, action, sx, sy, ex, ey, timestamp, chord=chord)
             self.pending_click = None
 
+    def finish_keyboard_segment(self, now, x, y):
+        segment = self.keyboard_segment
+        self.keyboard_segment = None
+        if segment is None:
+            return
+        began, start, keys, overlapping = segment
+        if overlapping or not keys or now <= began:
+            return
+        self.submit(start, KEYBOARD_ACTION_NAME, x, y, x, y, now,
+                    duration=now - began, key_code=keys[0],
+                    chord=",".join(map(str, keys)))
+
+    def start_keyboard_segment(self, now):
+        keys = tuple(sorted(self.pressed_keys))
+        if not keys:
+            self.keyboard_segment = None
+            return
+        frame = self.before_for(now)
+        if frame is not None:
+            self.keyboard_segment = (now, (frame, self.game, self.area,
+                                            self.video_before(now)), keys,
+                                     bool(self.pressed))
+
     def accept(self, entry):
         generation, now, message, x, y, data, hwnd = entry
         if generation != self.generation or hwnd != self.window:
@@ -11275,7 +14046,12 @@ class PassiveMouseObserver:
             return
         self.last_input = now
         if is_key:
-            if message in (WM_KEYDOWN, WM_SYSKEYDOWN):
+            key_down = message in (WM_KEYDOWN, WM_SYSKEYDOWN)
+            if key_down == (data in self.pressed_keys):
+                return
+            self.finish_keyboard_segment(now, x, y)
+            if key_down:
+                self.pressed_keys[data] = now
                 if self.pressed:
                     self.keyboard_overlaps.add(data)
                     for button, mouse_record in tuple(self.pressed.items()):
@@ -11283,24 +14059,15 @@ class PassiveMouseObserver:
                         joint_keys.add(data)
                         self.pressed[button] = (*mouse_record[:-1],
                                                 ",".join(map(str, sorted(joint_keys))))
-                if data not in self.pressed_keys:
-                    frame = self.before_for(now)
-                    if frame is not None:
-                        chord = ",".join(map(str, sorted((*self.pressed_keys, data))))
-                        start = (frame, self.game, self.area, self.video_before(now))
-                        self.pressed_keys[data] = (now, start, chord)
             else:
-                pressed = self.pressed_keys.pop(data, None)
-                overlapping = data in self.keyboard_overlaps
+                self.pressed_keys.pop(data, None)
                 self.keyboard_overlaps.discard(data)
-                if pressed is not None and not overlapping:
-                    began, start, chord = pressed
-                    self.submit(start, "键盘", x, y, x, y, now,
-                                duration=max(0.0, now - began), key_code=data, chord=chord)
+            self.start_keyboard_segment(now)
             return
         down_actions = {WM_LBUTTONDOWN: "左", WM_RBUTTONDOWN: "右", WM_MBUTTONDOWN: "中"}
         up_actions = {WM_LBUTTONUP: "左", WM_RBUTTONUP: "右", WM_MBUTTONUP: "中"}
         if message in down_actions:
+            self.finish_keyboard_segment(now, x, y)
             self.keyboard_overlaps.update(self.pressed_keys)
             button = down_actions[message]
             frame = self.before_for(now)
@@ -11310,6 +14077,8 @@ class PassiveMouseObserver:
             self.keyboard_overlaps.update(self.pressed_keys)
             button = up_actions[message]
             pressed = self.pressed.pop(button, None)
+            if not self.pressed and self.keyboard_segment is None:
+                self.start_keyboard_segment(now)
             if pressed is None:
                 return
             started, sx, sy, start, trajectory, began_chord = pressed
@@ -11411,7 +14180,7 @@ class PassiveMouseObserver:
         if self.area != self.native.window_bounds(self.window):
             return
         try:
-            after = self.native.capture(self.area, self.video_budget.profile()[0])
+            after = self.native.capture(self.area, self.video_budget.profile()[0], window=self.window)
             self.samples.append((time.monotonic(), self.window, self.area, after))
         except OSError:
             return
@@ -11424,7 +14193,7 @@ class PassiveMouseObserver:
             post = after
             if (before.width, before.height) != (after.width, after.height):
                 try:
-                    post = self.native.capture(self.area, max(before.width, before.height))
+                    post = self.native.capture(self.area, max(before.width, before.height), window=self.window)
                 except OSError:
                     continue
             began = time.monotonic()
@@ -11490,7 +14259,9 @@ class PassiveMouseObserver:
                             self.world_trace.append(WorldTraceStep(
                                 coarse, next_coarse, control_key,
                                 before_scene.signature, after_scene.signature,
-                                video.signature, next_video.signature))
+                                video.signature, next_video.signature,
+                                COORDINATE_CENTER, COORDINATE_CENTER,
+                                COORDINATE_CENTER, COORDINATE_CENTER, -1, effect))
                     self.total += 1
                     self.app.events.put(("observation", (self.total, "键盘")))
                 else:
@@ -11551,7 +14322,9 @@ class PassiveMouseObserver:
                                 coarse, next_coarse, control_key,
                                 original_scene.signature, final_scene.signature,
                                 video.signature if video is not None else "",
-                                next_video.signature if next_video is not None else ""))
+                                next_video.signature if next_video is not None else "",
+                                x, y, to_x, to_y,
+                                variant if variant is not None else -1, effect))
                             if joint_keys:
                                 store.record_control_experience(
                                     game, coarse, "joint", action, cell, spot,
@@ -11611,7 +14384,9 @@ class PassiveMouseObserver:
                 if (self.hook_ready.is_set() and
                         (not self.hook_installed or time.monotonic() - self.last_hook_input > OBSERVER_HOOK_SILENCE_SECONDS)):
                     self.poll_input()
-                if self.hook_ready.is_set() and not self.keyboard_hook_installed:
+                if (self.hook_ready.is_set() and
+                        (not self.keyboard_hook_installed or
+                         time.monotonic() - self.last_keyboard_hook_input > OBSERVER_HOOK_SILENCE_SECONDS)):
                     self.poll_keyboard()
                 hwnd = self.native.user.GetForegroundWindow()
                 if (hwnd != self.app.observed_game_window
@@ -11636,7 +14411,7 @@ class PassiveMouseObserver:
                 capture_interval = max(capture_interval, budget_interval)
                 if now - self.last_sample >= capture_interval:
                     captured = time.monotonic()
-                    frame = self.native.capture(area, budget_edge)
+                    frame = self.native.capture(area, budget_edge, window=hwnd)
                     finished = time.monotonic()
                     if self.samples and (self.samples[-1][3].width, self.samples[-1][3].height) != (frame.width, frame.height):
                         self.samples.clear()
@@ -11739,6 +14514,7 @@ class Application:
         self.store = None
         self.worker = None
         self.export_worker = None
+        self.export_active = False
         self.accelerator_worker = None
         self.accelerator_threads = []
         self.accelerator_cancel = threading.Event()
@@ -11749,6 +14525,9 @@ class Application:
         self.running = False
         self.preparing = False
         self.steps = 0
+        self.decisions = 0
+        self.session_id = None
+        self.latest_action_frames = None
         self.base_steps = 0
         self.reward = 0.0
         self.effect = 0.0
@@ -11763,9 +14542,11 @@ class Application:
         self.video_cpu = None
         self.last_error = ""
         self.last_frame = None
+        self.recent_action_frames = collections.deque(maxlen=TEMPORAL_MAX_FRAMES)
         self.preview_image = None
         self.preview_source = None
         self.started_at = None
+        self.finished_elapsed = 0.0
         self.log_lines = 0
         self.pending_after_ids = set()
         self.last_counts_check = 0.0
@@ -11775,10 +14556,10 @@ class Application:
         self.dark_mode = UI_BACKGROUND == UI_DARK_BACKGROUND
         self.folder = tk.StringVar(value="尚未选择文件夹")
         self.download_percent = tk.DoubleVar(value=0.0)
-        self.scope_choice = tk.StringVar(value="")
-        self.window_choice = tk.StringVar(value="")
-        self.stop_choice = tk.StringVar(value="")
-        self.window_options = {}
+        self.scope_choice = tk.StringVar(value=SCOPE_FULLSCREEN)
+        self.model_choice = tk.StringVar(value=AI_MODEL_OWN)
+        self.external_model_status = "未启用"
+        self.stop_choice = tk.StringVar(value="ESC")
         self.operation_scope = None
         self.configured_stop_code = None
         self.configured_stop_name = None
@@ -11866,11 +14647,13 @@ class Application:
         self.apply_styles()
         body = ttk.Frame(root, padding=UI_SPACING_LG)
         body.pack(fill="both", expand=True)
+        self.body = body
+        self.layout_pending = False
         self.wrap_labels = []
         self.last_responsive_layout = None
-        body.bind("<Configure>", self.responsive_layout)
-        ttk.Label(body, text=APP_NAME, style="Heading.TLabel").pack(anchor="w")
-        self.wrapped_label(body, textvariable=self.status, wraplength=UI_WRAP_HEADER).pack(anchor="w", pady=(0, UI_SPACING_SM))
+        body.bind("<Configure>", self.request_layout)
+        self.heading_label = self.wrapped_label(body, text=APP_NAME, style="Heading.TLabel")
+        self.status_label = self.wrapped_label(body, textvariable=self.status)
         self.download_bar = ttk.Progressbar(body, mode="determinate", maximum=PERCENT_SCALE, variable=self.download_percent)
         folder_row = ttk.Frame(body)
         self.folder_row = folder_row
@@ -11880,6 +14663,12 @@ class Application:
         self.wrapped_label(folder_row, textvariable=self.folder, wraplength=UI_WRAP_HINT).pack(side="left", fill="x", expand=True)
         self.folder_button = ttk.Button(folder_row, text="选择文件夹", command=self.select_folder)
         self.folder_button.pack(side="right")
+        model_row = ttk.Frame(body)
+        model_row.pack(fill="x", pady=(0, UI_SPACING_XS))
+        ttk.Label(model_row, text="AI模型：", style="Muted.TLabel").pack(side="left")
+        self.model_selector = ttk.Combobox(model_row, textvariable=self.model_choice,
+                                           values=AI_MODEL_OPTIONS, state="disabled", width=20)
+        self.model_selector.pack(side="left", fill="x", expand=True)
         scope_row = ttk.Frame(body)
         scope_row.pack(fill="x", pady=(0, UI_SPACING_XS))
         ttk.Label(scope_row, text="操作范围：", style="Muted.TLabel").pack(side="left")
@@ -11887,31 +14676,34 @@ class Application:
                                            values=SCOPE_OPTIONS, state="disabled", width=20)
         self.scope_selector.pack(side="left", fill="x", expand=True)
         self.scope_selector.bind("<<ComboboxSelected>>", self.on_scope_change)
-        self.window_row = ttk.Frame(body)
-        ttk.Label(self.window_row, text="目标窗口：", style="Muted.TLabel").pack(side="left")
-        self.window_selector = ttk.Combobox(self.window_row, textvariable=self.window_choice,
-                                            state="disabled", width=56)
-        self.window_selector.pack(side="left", fill="x", expand=True)
-        self.window_selector.bind("<<ComboboxSelected>>", self.on_window_change)
         stop_row = ttk.Frame(body)
         stop_row.pack(fill="x", pady=(0, UI_SPACING_XS))
         ttk.Label(stop_row, text="停止按键：", style="Muted.TLabel").pack(side="left")
         self.stop_selector = ttk.Combobox(stop_row, textvariable=self.stop_choice,
                                           values=tuple(STOP_KEY_CODES), state="disabled", width=20)
         self.stop_selector.pack(side="left", fill="x", expand=True)
-        self.wrapped_label(body, textvariable=self.target_text, style="Muted.TLabel", wraplength=UI_WRAP_HEADER).pack(anchor="w", pady=(0, UI_SPACING_SM))
+        self.target_label = self.wrapped_label(body, textvariable=self.target_text, style="Muted.TLabel")
         metrics = ttk.Frame(body)
         metrics.pack(fill="x", pady=(0, UI_SPACING_XS))
         for column in range(UI_METRIC_COLUMNS):
             metrics.grid_columnconfigure(column, weight=1, uniform="metric")
         self.metrics = metrics
         self.metric_tiles = []
+        self.metric_entries = []
+        self.metric_headings = []
+        self.metric_snapshot = None
+        metrics.bind("<Configure>", self.fit_metrics)
         for index, (heading, variable) in enumerate((("累计操作", self.step_text), ("用户示范", self.demonstration_text), ("最近动作", self.action_text), ("累计场景", self.states_text), ("综合奖励", self.reward_text), ("连续无效", self.no_effect_text), ("视频参数", self.vision_text), ("运行时间", self.runtime_text), ("操作速率", self.rate_text))):
             tile = ttk.Frame(metrics, padding=UI_SPACING_SM, style="Card.TFrame")
             self.metric_tiles.append(tile)
             tile.grid(row=index // UI_METRIC_COLUMNS, column=index % UI_METRIC_COLUMNS, sticky="nsew", padx=UI_SPACING_FINE, pady=UI_SPACING_FINE)
-            ttk.Label(tile, text=heading, style="CardMuted.TLabel").pack(anchor="w")
-            ttk.Label(tile, textvariable=variable, style="Metric.TLabel").pack(anchor="w")
+            heading_label = ttk.Label(tile, text=heading, style="CardMuted.TLabel")
+            heading_label.pack(anchor="w", fill="x")
+            self.metric_headings.append(heading_label)
+            value_label = ttk.Label(tile, textvariable=variable, style="Metric.TLabel",
+                                    wraplength=UI_WRAP_MINIMUM, justify="left")
+            value_label.pack(anchor="w", fill="x")
+            self.metric_entries.append((variable, value_label))
         controls = ttk.Frame(body)
         controls.pack(fill="x", pady=(UI_SPACING_SM, UI_SPACING_XS))
         self.start_button = ttk.Button(controls, text="启动", style="Primary.TButton", command=self.start, state="disabled")
@@ -11936,7 +14728,17 @@ class Application:
         self.log_view = self.tk.Text(records, wrap="word", state="disabled", height=UI_LOG_VISIBLE_ROWS, width=UI_LOG_VISIBLE_COLUMNS, bg=UI_CARD, fg=UI_FOREGROUND, relief="flat", padx=UI_SPACING_SM, pady=UI_SPACING_SM, font=("Consolas", UI_FONT_BASE), cursor="arrow")
         self.log_view.pack(fill="both", expand=True, padx=UI_SPACING_XS, pady=UI_SPACING_XS)
         self.draw_preview()
-        self.root.after_idle(self.responsive_layout)
+        self.layout_widgets = (self.heading_label, self.status_label, self.download_bar,
+                               folder_row, model_row, scope_row, stop_row, self.target_label,
+                               metrics, controls, panels)
+        for widget in self.layout_widgets:
+            widget.pack_forget()
+        for row, widget in enumerate(self.layout_widgets):
+            widget.grid(row=row, column=0, sticky="nsew", pady=(0, UI_SPACING_XS))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(len(self.layout_widgets) - 1, weight=1)
+        self.download_bar.grid_remove()
+        self.request_layout()
         self.log("控制台已创建；等待选择文件夹")
 
     def wrapped_label(self, parent, **kwargs):
@@ -11948,44 +14750,116 @@ class Application:
         for label in self.wrap_labels:
             if not label.winfo_exists():
                 continue
-            width = max(UI_WRAP_MINIMUM, label.master.winfo_width() - UI_SPACING_SECTION - UI_SPACING_MD)
-            if int(label.cget("wraplength")) != width:
+            parent = label.master
+            width = parent.winfo_width()
+            if parent is self.body:
+                width -= 2 * UI_SPACING_LG
+            else:
+                for sibling in parent.winfo_children():
+                    if sibling is not label and sibling.winfo_manager():
+                        width -= sibling.winfo_reqwidth()
+            width = max(1, width)
+            if int(label.cget("wraplength") or 0) != width:
                 label.configure(wraplength=width)
 
 
-    def responsive_layout(self, event=None):
-        self.fit_text()
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        compact = height < UI_METRIC_COMPACT_HEIGHT
-        columns = UI_METRIC_COMPACT_COLUMNS if width < UI_METRIC_COMPACT_WIDTH else UI_METRIC_COLUMNS
-        stack = width < UI_PANEL_STACK_WIDTH
-        layout = (compact, columns, stack)
-        if layout == self.last_responsive_layout:
+    def fit_metrics(self, event=None):
+        from tkinter import font as font_module
+        fonts = getattr(self, "metric_fonts", None)
+        if fonts is None:
+            fonts = {size: font_module.Font(root=self.root, family="Segoe UI", size=size, weight="bold")
+                     for size in range(UI_FONT_BASE, UI_FONT_METRIC + 1)}
+            self.metric_fonts = fonts
+        for tile, heading, (variable, label) in zip(self.metric_tiles, self.metric_headings, self.metric_entries):
+            if not tile.winfo_manager() or tile.winfo_width() <= 1:
+                continue
+            available = max(1, tile.winfo_width() - 2 * UI_SPACING_SM)
+            value = variable.get()
+            size = next((size for size in reversed(tuple(fonts))
+                         if fonts[size].measure(value) <= available), UI_FONT_BASE)
+            label.configure(font=fonts[size], wraplength=available)
+            heading.configure(wraplength=available)
+
+    def request_layout(self, event=None):
+        if self.layout_pending:
             return
-        self.last_responsive_layout = layout
-        for tile in self.metric_tiles:
-            tile.grid_forget()
-        for column in range(UI_METRIC_COLUMNS):
-            self.metrics.grid_columnconfigure(column, weight=int(column < columns))
-        for index, tile in enumerate(self.metric_tiles[:UI_COMPACT_METRIC_COUNT] if compact else self.metric_tiles):
-            tile.grid(row=index // columns, column=index % columns, sticky="nsew", padx=UI_SPACING_FINE, pady=UI_SPACING_FINE)
-        self.photo_box.grid_forget()
-        self.records_box.grid_forget()
-        if stack:
-            self.panels.grid_columnconfigure(0, weight=1)
-            self.panels.grid_columnconfigure(1, weight=0)
-            self.panels.grid_rowconfigure(0, weight=1)
-            self.panels.grid_rowconfigure(1, weight=1)
-            self.photo_box.grid(row=0, column=0, sticky="nsew", pady=(0, UI_SPACING_XS))
-            self.records_box.grid(row=1, column=0, sticky="nsew", pady=(UI_SPACING_XS, 0))
-        else:
-            self.panels.grid_columnconfigure(0, weight=1)
-            self.panels.grid_columnconfigure(1, weight=1)
-            self.panels.grid_rowconfigure(0, weight=1)
-            self.panels.grid_rowconfigure(1, weight=0)
-            self.photo_box.grid(row=0, column=0, sticky="nsew", padx=(0, UI_SPACING_XS))
-            self.records_box.grid(row=0, column=1, sticky="nsew", padx=(UI_SPACING_XS, 0))
+        self.layout_pending = True
+        def apply():
+            self.layout_pending = False
+            self.responsive_layout()
+        self.root.after_idle(apply)
+
+    def responsive_layout(self, event=None):
+        from tkinter import font as font_module
+        if not hasattr(self, 'layout_widgets') or self.body.winfo_width() <= 1:
+            return
+        self.fit_text()
+        normal = font_module.Font(root=self.root, font=self.styles.lookup('TLabel', 'font'))
+        metric = font_module.Font(root=self.root, family="Segoe UI", size=UI_FONT_METRIC, weight="bold")
+        available_width = max(1, self.body.winfo_width() - 2 * UI_SPACING_LG)
+        desired_width = max(max(normal.measure(heading.cget('text')),
+                                metric.measure(variable.get()))
+                            for heading, (variable, _) in zip(self.metric_headings, self.metric_entries))
+        tile_width = desired_width + 2 * (UI_SPACING_SM + UI_SPACING_FINE)
+        columns = max(1, min(len(self.metric_tiles), available_width // max(1, tile_width)))
+        panel_width = max(normal.measure(self.photo_box.cget('text')),
+                          normal.measure(self.records_box.cget('text')),
+                          normal.measure('0') * UI_LOG_VISIBLE_COLUMNS) + 2 * UI_SPACING_SM
+        stack = available_width < 2 * panel_width + 2 * UI_SPACING_XS
+        fixed = sum(widget.winfo_reqheight() + UI_SPACING_XS for widget in self.layout_widgets
+                    if widget not in (self.metrics, self.panels)
+                    and (widget is not self.download_bar or widget.winfo_manager()))
+        usable_height = max(0, self.body.winfo_height() - 2 * UI_SPACING_LG - fixed)
+        tile_height = normal.metrics('linespace') + metric.metrics('linespace') + 2 * (UI_SPACING_SM + UI_SPACING_FINE)
+        log_minimum = normal.metrics('linespace') * 2 + 2 * UI_SPACING_SM
+        rows = max(0, (usable_height - log_minimum) // max(1, tile_height))
+        count = min(len(self.metric_tiles), rows * columns)
+        priorities = ((0, 2, 4, 5, 7, 8, 1, 3, 6) if self.steps else
+                      (0, 1, 3, 6, 4, 7, 2, 5, 8))
+        selected = tuple(range(len(self.metric_tiles))) if count == len(self.metric_tiles) else priorities[:count]
+        panel_height = max(0, usable_height - math.ceil(count / columns) * tile_height)
+        show_photo = panel_height >= log_minimum * (2 if stack else 1)
+        layout = (columns, stack, selected, show_photo)
+        if layout != self.last_responsive_layout:
+            self.last_responsive_layout = layout
+            for tile in self.metric_tiles:
+                tile.grid_forget()
+            for column in range(len(self.metric_tiles)):
+                active = column < columns
+                self.metrics.grid_columnconfigure(column, weight=int(active),
+                                                  uniform="metric" if active else "", minsize=0, pad=0)
+            for index, tile_number in enumerate(selected):
+                self.metric_tiles[tile_number].grid(row=index // columns, column=index % columns,
+                    sticky="nsew", padx=UI_SPACING_FINE, pady=UI_SPACING_FINE)
+            if selected:
+                self.metrics.grid()
+            else:
+                self.metrics.grid_remove()
+            self.photo_box.grid_forget()
+            self.records_box.grid_forget()
+            for column in range(2):
+                active = column == 0 or (show_photo and not stack)
+                self.panels.grid_columnconfigure(column, weight=int(active),
+                    uniform="panel" if active else "", minsize=0, pad=0)
+            for row in range(2):
+                active = row == 0 or (show_photo and stack)
+                self.panels.grid_rowconfigure(row, weight=int(active), minsize=0, pad=0)
+            if show_photo:
+                self.photo_box.grid(row=0, column=0, sticky="nsew")
+                self.records_box.grid(row=int(stack), column=int(not stack), sticky="nsew")
+            else:
+                self.records_box.grid(row=0, column=0, sticky="nsew")
+            self.root.after_idle(self.fit_metrics)
+        self.preview_canvas.configure(height=max(normal.metrics('linespace'),
+            panel_height // (2 if stack else 1) - normal.metrics('linespace') - 2 * UI_SPACING_SM))
+        self.log_view.configure(height=max(1, (panel_height // (2 if stack and show_photo else 1)
+            - normal.metrics('linespace') - 2 * UI_SPACING_SM) // max(1, normal.metrics('linespace'))))
+        required_width = max(self.start_button.winfo_reqwidth() + self.blackbox_button.winfo_reqwidth(),
+                             self.folder_button.winfo_reqwidth() + normal.measure('数据目录：')) + 2 * UI_SPACING_LG
+        required_height = fixed + log_minimum + 2 * UI_SPACING_LG
+        self.root.minsize(min(required_width, self.root.winfo_screenwidth()),
+                         min(required_height, self.root.winfo_screenheight()))
+        self.fit_metrics()
 
     def log(self, message):
         self.log_view.configure(state="normal")
@@ -12040,69 +14914,120 @@ class Application:
                 (self.worker is not None and self.worker.is_alive() and not self.running))
 
     def on_scope_change(self, event=None):
-        if self.scope_choice.get() == SCOPE_WINDOW:
-            if not self.window_row.winfo_manager():
-                self.window_row.pack(fill="x", pady=(0, UI_SPACING_XS), before=self.stop_selector.master)
-            self.refresh_window_list()
-            self.on_window_change()
-        else:
-            self.window_row.pack_forget()
-            self.observer.activate(False)
-            self.observed_game_window = None
-            self.observed_game_owner = None
+        self.observer.activate(False)
+        self.observed_game_window = None
+        self.observed_game_owner = None
+        self.observe_foreground()
         self.update_target_preview()
 
-    def on_window_change(self, event=None):
-        if self.scope_choice.get() != SCOPE_WINDOW or self.running:
+    def observe_foreground(self):
+        if (self.running or self.preparing or self.store is None):
             return
-        hwnd = self.window_options.get(self.window_choice.get())
-        if hwnd is not None and self.native.window_bounds(hwnd) is None:
-            hwnd = None
-        if hwnd != self.observed_game_window:
+        own = self.native.user.GetAncestor(self.root.winfo_id(), GA_ROOT)
+        foreground = self.native.user.GetForegroundWindow()
+        if foreground == own:
+            if self.observed_game_window is None:
+                foreground = self.native.foreground_window(own)[0]
+            else:
+                return
+        if foreground is None or self.native.window_bounds(foreground) is None:
+            return
+        if foreground != self.observed_game_window:
             self.observer.activate(False)
-            self.observed_game_window = hwnd
-            self.observed_game_owner = self.native.window_owner(hwnd) if hwnd else None
-            if hwnd is not None and self.store is not None:
-                self.observer.activate(True)
-        self.update_target_preview()
+            self.observed_game_window = foreground
+            self.observed_game_owner = self.native.window_owner(foreground)
+            self.observer.activate(True)
 
-    def refresh_window_list(self):
-        if self.running:
-            return
-        current_hwnd = self.window_options.get(self.window_choice.get())
-        discovered = {}
-        for hwnd, caption in self.native.windows():
-            label = f"{caption[:WINDOW_DISPLAY_NAME_LIMIT]} · 0x{int(hwnd):X}"
-            discovered[label] = hwnd
-        if discovered != self.window_options:
-            self.window_options = discovered
-            self.window_selector.configure(values=tuple(discovered))
-            restored = next((name for name, hwnd in discovered.items() if hwnd == current_hwnd), "")
-            self.window_choice.set(restored)
-            if not restored and current_hwnd is not None:
-                self.on_window_change()
+    def target_state(self, hwnd, area, frame=None):
+        foreground = self.native.foreground_identity()
+        expected_identity = frame.target_identity if frame is not None else None
+        actual_bounds = (self.native.bounds() if self.operation_scope == SCOPE_FULLSCREEN
+                         else self.native.window_bounds(hwnd))
+        owner = self.native.window_owner(hwnd) if hwnd is not None else None
+        reason = 'matched'
+        if self.operation_scope != SCOPE_FULLSCREEN:
+            if hwnd is None or owner is None or actual_bounds is None:
+                reason = 'target_unavailable'
+            elif (expected_identity is not None and expected_identity[0] == hwnd
+                  and expected_identity[1] != owner):
+                reason = 'owner_changed'
+            elif not self.native.target_is_foreground(hwnd):
+                reason = ('popup_transition' if self.native.same_window_family(hwnd, foreground[0])
+                          else 'focus_lost')
+        if reason == 'matched' and expected_identity is not None and expected_identity != foreground:
+            reason = ('popup_transition' if hwnd is not None and
+                      self.native.same_window_family(hwnd, foreground[0]) else 'foreground_changed')
+        if reason == 'matched' and actual_bounds != area:
+            if actual_bounds is not None and area is not None:
+                reason = 'window_resized' if actual_bounds[2:] != area[2:] else 'window_moved'
+            else:
+                reason = 'bounds_unavailable'
+        return {'reason': reason, 'scope': self.operation_scope, 'expected_window': hwnd,
+                'expected_identity': expected_identity, 'actual_identity': foreground,
+                'actual_owner': owner, 'expected_bounds': area, 'actual_bounds': actual_bounds,
+                'frame_id': frame.frame_id if frame is not None else None}
 
-    def target_matches(self, hwnd, area):
+    def target_matches(self, hwnd, area, frame=None):
+        return self.target_state(hwnd, area, frame)['reason'] == 'matched'
+
+    def feedback_transition(self, root_window, root_owner, window, before, stream):
+        state = self.target_state(window, before.bounds, before)
+        if state['reason'] == 'matched':
+            return None
+        if root_window is None:
+            root_window = before.cache.get('root_window')
+            root_owner = before.cache.get('root_owner')
+        if root_window is None or root_owner is None or self.native.window_owner(root_window) != root_owner:
+            raise TargetChanged(state)
+        foreground = self.native.foreground_identity()
+        candidate = foreground[0] if foreground else None
+        owner = self.native.window_owner(candidate) if candidate else None
+        area = self.native.window_bounds(candidate) if candidate else None
+        if (candidate is None or area is None or owner is None
+                or owner[0] != root_owner[0]
+                or not self.native.same_window_family(root_window, candidate)
+                or not self.native.target_is_foreground(candidate)):
+            raise TargetChanged(state)
+        if candidate == window and state['reason'] not in ('window_moved', 'window_resized'):
+            raise TargetChanged(state)
+        details = {'kind': 'window_transition', 'reason': state['reason'],
+                   'root_window': root_window, 'root_owner': root_owner,
+                   'before_identity': before.target_identity, 'after_identity': foreground,
+                   'before_bounds': before.bounds, 'after_bounds': area}
+        stream.end_action()
         if self.operation_scope == SCOPE_FULLSCREEN:
-            return area is not None and self.native.bounds() == area
-        return (hwnd is not None and self.native.target_is_foreground(hwnd)
-                and self.native.window_bounds(hwnd) == area)
+            area, candidate, owner = self.native.bounds(), None, None
+            details['after_bounds'] = area
+        stream.target(area, candidate, foreground)
+        return candidate, area, owner, details
+
+    def require_target(self, hwnd, area, frame=None):
+        state = self.target_state(hwnd, area, frame)
+        if state['reason'] != 'matched':
+            raise TargetChanged(state)
+        return state
 
     def start(self):
         if (self.running or self.preparing or self.any_background_worker() or not self.store
                 or not self.guard.ready.is_set() or not self.guard.thread.is_alive()):
             return
         scope = self.scope_choice.get()
+        model_choice = self.model_choice.get()
         stop_name = self.stop_choice.get()
-        if scope not in SCOPE_OPTIONS or stop_name not in STOP_KEY_CODES:
-            self.status.set("请选择操作范围及停止按键")
+        if (scope not in SCOPE_OPTIONS or model_choice not in AI_MODEL_OPTIONS
+                or stop_name not in STOP_KEY_CODES):
+            self.status.set("请选择AI模型、操作范围及停止按键")
             return
         if scope == SCOPE_WINDOW:
-            target = self.window_options.get(self.window_choice.get())
-            area = self.native.window_bounds(target)
-            if target is None or area is None:
-                self.status.set("请选择当前可用的目标窗口")
-                return
+            target = self.observed_game_window
+            area = self.native.window_bounds(target) if target is not None else None
+            if area is None or self.native.window_owner(target) != self.observed_game_owner:
+                target, area = self.native.foreground_window(self.root.winfo_id())
+            if target is not None:
+                root_target = self.native.user.GetAncestor(target, GA_ROOTOWNER) or target
+                if self.native.window_owner(root_target) is not None:
+                    target = root_target
+                    area = self.native.window_bounds(target) or area
         else:
             target, area = None, self.native.bounds()
             if min(area[2:]) < MIN_TARGET_DIMENSION:
@@ -12111,7 +15036,13 @@ class Application:
         self.operation_scope = scope
         self.configured_stop_code = STOP_KEY_CODES[stop_name]
         self.configured_stop_name = stop_name
+        try:
+            self.native.release()
+        except Exception as error:
+            self.status.set("无法释放上次运行的按键：" + str(error))
+            return
         self.native.forbidden_key = self.configured_stop_code
+        self.external_model_status = "未启用" if model_choice == AI_MODEL_OWN else "正在连接第三方视觉模型"
         self.last_error = ""
         try:
             self.base_steps = self.store.counts()[1]
@@ -12119,6 +15050,9 @@ class Application:
             self.last_error = str(error)
             self.base_steps = 0
         self.steps = 0
+        self.decisions = 0
+        self.session_id = uuid.uuid4().hex
+        self.latest_action_frames = None
         self.reward = 0.0
         self.effect = 0.0
         self.visits = 0
@@ -12133,6 +15067,7 @@ class Application:
         self.vision_text.set(f"{self.vision_edge}px · {self.video_frames}帧")
         self.rate_text.set("0.0/分")
         self.last_frame = None
+        self.recent_action_frames.clear()
         self.preview_image = None
         self.preview_source = None
         self.last_target = None
@@ -12143,6 +15078,8 @@ class Application:
         self.no_effect_text.set("0")
         self.action_text.set("—")
         self.started_at = time.monotonic()
+        self.finished_elapsed = 0.0
+        self.store.session_started(self.session_id, utc_stamp())
         self.running = True
         self.observer.activate(False)
         self.start_button.configure(state="disabled")
@@ -12152,8 +15089,9 @@ class Application:
         self.initial_target_window, self.initial_target_area = target, area
         self.selected_game_id = self.native.game_id(target) if target is not None else None
         self.session_config = AgentSessionConfig(
-            scope, stop_name, self.configured_stop_code, target, tuple(area),
-            self.selected_game_id)
+            scope, stop_name, self.configured_stop_code, target,
+            tuple(area) if area is not None else None,
+            self.selected_game_id, model_choice)
         self.learning_runtime = None
         self.observed_game_window = self.initial_target_window
         self.observed_game_owner = (self.native.window_owner(self.initial_target_window)
@@ -12228,8 +15166,13 @@ class Application:
                 self.last_error = traceback.format_exc()
                 if self.store:
                     self.store.event("release_error", self.last_error)
+            self.finished_elapsed = self.session_elapsed()
             if self.store:
-                self.store.event("stop", {"steps": self.steps, "keyboard_stop": self.stop.is_set()})
+                elapsed = self.finished_elapsed
+                self.store.session_progress(self.session_id, elapsed, stopped=self.stop.is_set())
+                self.store.event('stop' if self.stop.is_set() else 'worker_restart',
+                                 {'session_id': self.session_id, 'steps': self.steps,
+                                  'keyboard_stop': self.stop.is_set(), 'session_elapsed': elapsed})
             self.learning_runtime = None
             self.events.put(("agent_finished", self.steps))
 
@@ -12256,6 +15199,8 @@ class Application:
         configuration = self.session_config
         fullscreen = configuration.scope == SCOPE_FULLSCREEN
         stream = AdaptiveVideoStream(self.native, self.stop, budget)
+        external_advisor = (ExternalVisionAdvisor(self.stop, self.events)
+                            if configuration.ai_model == AI_MODEL_EXTERNAL else None)
         policy.local_budget = budget
         if policy.goals is not None:
             policy.goals.budget = budget
@@ -12271,6 +15216,7 @@ class Application:
         window = None if fullscreen else configuration.window
         window_owner = self.native.window_owner(window) if window else None
         last_known_owner = window_owner
+        root_window, root_owner = window, window_owner
         last_target_check = 0.0
         fullscreen_foreground = None
         last_reported_profile = None
@@ -12291,31 +15237,64 @@ class Application:
                     else:
                         window, area = self.native.foreground_window(self.root_hwnd)
                 if not fullscreen and window is not None:
+                    root_window = window
+                    root_owner = self.native.window_owner(root_window)
+                    window = self.native.interaction_window(root_window) or root_window
                     self.native.activate_window(window)
                     area = self.native.window_bounds(window) or area
-                    game = self.native.game_id(window)
+                    game = self.native.game_id(root_window)
                     if game != policy.game_id:
                         policy.reset_scene(game)
                     self.selected_game_id = policy.game_id
                     self.last_target_caption = self.native.window_caption(window)
                     window_owner = self.native.window_owner(window)
-                    last_known_owner = window_owner
+                    last_known_owner = root_owner
                     self.observed_game_window = window
                     self.observed_game_owner = window_owner
                 self.last_target = area
                 self.events.put(("target_info", (self.last_target_caption, area)))
-                self.store.event("start", {"time": utc_stamp(), "monitor_bounds": self.native.bounds(),
+                self.store.event("start", {"time": utc_stamp(), "session_id": self.session_id,
+                                           "session_elapsed": time.monotonic() - self.started_at,
+                                           "monitor_bounds": self.native.bounds(),
                                            "window_bounds": area, "game_id": policy.game_id,
                                            "window_title": self.last_target_caption, "mouse_only": False,
                                            "scope": configuration.scope, "stop_key": configuration.stop_name,
-                                           "video_stream": True, "keyboard_learning": True})
+                                           "video_stream": True, "keyboard_learning": True,
+                                           "state_encoding_version": STATE_ENCODING_VERSION,
+                                           "random": self.store.random_snapshot()})
             except Exception:
                 self.last_error = traceback.format_exc()
                 self.store.event("initialization_error", self.last_error)
                 self.events.put(("agent_error", self.last_error.splitlines()[-1]))
             while not self.stop.is_set():
                 started = time.monotonic()
+                attempt = None
+                before = after = None
+                phase = 'target'
+                phase_times = {}
                 try:
+                    if not fullscreen and root_window is not None:
+                        if self.native.window_owner(root_window) == root_owner:
+                            current_window = self.native.interaction_window(root_window)
+                            if current_window is not None and current_window != window:
+                                self.native.release()
+                                self.store.event("target_transition", {
+                                    "from": window, "to": current_window, "root": root_window,
+                                    "foreground": self.native.foreground_identity()})
+                                window = current_window
+                                area = self.native.window_bounds(window)
+                                window_owner = self.native.window_owner(window)
+                                self.last_target_caption = self.native.window_caption(window)
+                                self.observed_game_window = window
+                                self.observed_game_owner = window_owner
+                                self.events.put(('target_info', (self.last_target_caption, area)))
+                                previous = last_sampled = last_command_finished = None
+                                policy.cancel_pending_decision()
+                                sequence_controller.cancel()
+                                policy.prior = policy.background_ema = None
+                                stream.target(None)
+                        else:
+                            root_window = root_owner = None
                     if fullscreen:
                         bounds = self.native.bounds()
                         if area != bounds:
@@ -12361,7 +15340,12 @@ class Application:
                             area = refreshed
                             self.last_target = refreshed
                             if not self.native.activate_window(window):
-                                raise OSError("目标窗口暂时无法取得前台焦点，自动重试以避免误点其他窗口")
+                                state = self.target_state(window, area)
+                                if state['reason'] == 'matched':
+                                    state['reason'] = 'activation_unconfirmed'
+                                state['recovery_action'] = 'activate_window'
+                                state['recovery_succeeded'] = False
+                                raise TargetChanged(state)
                     if not fullscreen and window is None and started - last_target_check >= RECOVER_WINDOW_EVERY_SECONDS:
                         last_target_check = started
                         if self.selected_game_id:
@@ -12369,12 +15353,16 @@ class Application:
                         else:
                             window, area = self.native.foreground_window(self.root_hwnd)
                         if window is not None:
+                            root_window = window
+                            root_owner = self.native.window_owner(root_window)
+                            window = self.native.interaction_window(root_window) or root_window
+                            area = self.native.window_bounds(window)
                             self.native.activate_window(window)
                             window_owner = self.native.window_owner(window)
-                            last_known_owner = window_owner
+                            last_known_owner = root_owner
                             self.observed_game_window = window
                             self.observed_game_owner = window_owner
-                            game = self.native.game_id(window)
+                            game = self.native.game_id(root_window)
                             if game != policy.game_id:
                                 policy.reset_scene(game)
                             previous = None
@@ -12385,17 +15373,33 @@ class Application:
                     if area is None or (not fullscreen and window is None):
                         raise OSError("目标游戏窗口暂时不可用，持续尝试重新定位")
                     self.last_target = area
-                    stream.target(area, window)
+                    stream.target(area, window, self.native.foreground_identity())
+                    phase = 'capture'
+                    capture_wait_started = time.monotonic()
                     captured, clip = stream.wait_frame(newer_than=last_sampled)
+                    phase_times['capture_wait'] = time.monotonic() - capture_wait_started
+                    if fullscreen and self.native.user.GetForegroundWindow() != fullscreen_foreground:
+                        last_target_check = 0.0
+                        continue
                     if captured is None:
                         return
                     before_stamp, before = captured
                     last_sampled = before_stamp
+                    self.require_target(window, area, before)
                     if before.bounds != area:
-                        continue
+                        raise TargetChanged({'reason': 'captured_bounds_changed',
+                                             'expected_bounds': area, 'actual_bounds': before.bounds})
+                    stream.begin_action(before)
+                    phase = 'decision'
                     decision_started = time.monotonic()
+                    policy.observe_delayed(before, self.session_id)
                     video_before = TemporalVideo.describe(clip, budget.profile()[1])
                     context, coarse_context, cell, spot, action, x, y, to_x, to_y, to_cell, variant, demonstration_id = policy.pick(before, video_before)
+                    external_choice = (external_advisor.consult(
+                        before, policy.game_id, coarse_context, policy.director.active,
+                        configuration.stop_code,
+                        (policy.fingerprint(before), context, policy.semantic_scene.signature),
+                        video_before.motion, budget.profile()[2]) if external_advisor is not None else None)
                     keyboard_choice = keyboard_learner.choose(policy, before, coarse_context,
                                                               video_before, configuration.stop_code,
                                                               force=True)
@@ -12427,7 +15431,9 @@ class Application:
                     predicted = (sequence_choice if sequence_choice is not None else
                                  self.store.world_choice(policy.game_id, coarse_context,
                                                          policy.semantic_scene.signature,
-                                                         policy.director.active, video_before.signature))
+                                                         policy.director.active, video_before.signature,
+                                                         budget.planning_budget(max(
+                                                             policy.no_effect_steps, policy.director.no_progress))))
                     replay_chance = WORLD_MODEL_REPLAY_CHANCE / (
                         1.0 + WORLD_MODEL_STAGNATION_DECAY
                         * max(policy.no_effect_steps, policy.director.no_progress))
@@ -12490,12 +15496,30 @@ class Application:
                             x = y = to_x = to_y = COORDINATE_CENTER
                             cell, spot = position_cell_spot(x, y)
                             to_cell, variant, demonstration_id = cell, None, None
-                            policy.last_decision_source = keyboard_choice[2]
+                            policy.last_decision_source = (
+                                'demonstration' if keyboard_choice[2] == '键盘示范' else 'keyboard')
                             policy.last_cell, policy.last_spot = cell, spot
                             policy.last_action, policy.last_destination = action, cell
                         else:
                             keyboard_choice = None
-                    decision_cost = time.monotonic() - decision_started
+                    if external_choice is not None:
+                        policy.cancel_pending_decision()
+                        sequence_controller.cancel()
+                        sequence_choice = None
+                        model_replay = False
+                        action, x, y, to_x, to_y, external_keys, external_duration = external_choice
+                        keyboard_choice = ((external_keys, external_duration, "第三方AI")
+                                           if external_keys else None)
+                        combined_choice = bool(external_keys and action != KEYBOARD_ACTION_NAME)
+                        cell, spot = position_cell_spot(x, y)
+                        to_cell = (position_cell_spot(to_x, to_y)[0]
+                                   if action in ACTION_DESTINATION_ACTIONS else cell)
+                        variant, demonstration_id = None, None
+                        policy.last_decision_source = "external_ai"
+                        policy.last_transfer_used = False
+                        policy.last_cell, policy.last_spot = cell, spot
+                        policy.last_context = context
+                        policy.last_action, policy.last_destination = action, to_cell
                     control = None
                     for sample_stamp, sample_frame in reversed(clip[:-1]):
                         if (sample_stamp < before_stamp
@@ -12517,35 +15541,120 @@ class Application:
                         due = gap * TEMPORAL_TIMING_PRIOR_WEIGHT - (time.monotonic() - last_command_finished)
                         if due > 0.0 and self.stop.wait(due):
                             return
-                    if not self.target_matches(window, before.bounds):
-                        raise OSError("操作区域或窗口焦点变化，正在重新捕获画面")
-                    if (time.monotonic() - before_stamp >= STATE_REVALIDATION_MIN_AGE_SECONDS
-                            and stale_replans < STATE_REVALIDATION_MAX_SKIPS):
+                    self.require_target(window, before.bounds, before)
+                    if fullscreen and self.native.user.GetForegroundWindow() != fullscreen_foreground:
+                        raise OSError("全屏前台窗口已变化，取消使用旧游戏画面")
+                    motion_load = video_before.motion / TEMPORAL_MOTION_NORMALIZER
+                    validity = max(TEMPORAL_MIN_INTERVAL_SECONDS,
+                                   min(STATE_REVALIDATION_MIN_AGE_SECONDS,
+                                       budget.profile()[2] * TEMPORAL_AFTER_MAX_EVALUATIONS
+                                       / (1.0 + motion_load)))
+                    if time.monotonic() - before_stamp >= validity:
                         latest = stream.peek_frame()
+                        if latest is None or latest[0] <= before_stamp:
+                            policy.cancel_pending_decision()
+                            sequence_controller.cancel()
+                            continue
                         if latest is not None and latest[0] > before_stamp:
                             newest = latest[1]
                             if (newest.width, newest.height, newest.bounds) == (
                                     before.width, before.height, before.bounds):
                                 new_context, new_coarse = policy.context(newest)
-                                if (new_coarse != coarse_context and
-                                        policy.difference(before, newest) >= STATE_REVALIDATION_DIFFERENCE):
+                                change = policy.difference(before, newest)
+                                fingerprint_delta = policy.fingerprint_distance(
+                                    policy.fingerprint(before), policy.fingerprint(newest))
+                                change_threshold = max(1 / COLOR_MAX,
+                                    policy.adaptive_value(coarse_context, 'passive_change', STATE_REVALIDATION_DIFFERENCE))
+                                outdated = (change >= change_threshold or
+                                            policy.coarse_context_distance(new_coarse, coarse_context) > DEMONSTRATION_GENERAL_CONTEXT_DISTANCE or
+                                            fingerprint_delta is not None and
+                                            fingerprint_delta > MODEL_VISUAL_MATCH_DISTANCE)
+                                if outdated and stale_replans < STATE_REVALIDATION_MAX_SKIPS:
                                     stale_replans += 1
                                     policy.cancel_pending_decision()
+                                    sequence_controller.cancel()
                                     continue
+                                if outdated:
+                                    policy.cancel_pending_decision()
+                                    sequence_controller.cancel()
+                                    before_stamp, before = latest
+                                    last_sampled = before_stamp
+                                    video_before = TemporalVideo.describe(
+                                        stream.frames_between(before_stamp - TEMPORAL_MAX_WINDOW_SECONDS,
+                                                              before_stamp), budget.profile()[1])
+                                    (context, coarse_context, cell, spot, action, x, y,
+                                     to_x, to_y, to_cell, variant, demonstration_id) = policy.pick(
+                                         before, video_before)
+                                    keyboard_choice = None
+                                    combined_choice = False
+                                    model_replay = False
+                                    sequence_choice = None
+                                    control = None
+                                    background = (policy.difference(previous, before)
+                                                  if action == KEYBOARD_ACTION_NAME else
+                                                  SPOT_CHANGE_WEIGHT * policy.difference(previous, before, cell, spot)
+                                                  + REGION_CHANGE_WEIGHT * policy.difference(previous, before, cell)
+                                                  + GLOBAL_CHANGE_WEIGHT * policy.difference(previous, before))
                     stale_replans = 0
+                    decision_cost = time.monotonic() - decision_started
                     self.native.active_target_window = window
                     self.native.active_target_owner = window_owner
                     action_started = time.monotonic()
+                    phase_times['decision'] = decision_cost
                     x, y, to_x, to_y = policy.predict_target(
                         action, x, y, to_x, to_y, before_stamp, action_started)
                     cell, spot = position_cell_spot(x, y)
                     to_cell = position_cell_spot(to_x, to_y)[0] if action in ACTION_DESTINATION_ACTIONS else cell
+                    actual_mode = control_arbiter.refine(
+                        policy, coarse_context, action, cell, spot,
+                        keyboard_choice[0] if keyboard_choice else (), demonstration_id)
+                    if combined_choice and actual_mode != 'joint':
+                        sequence_controller.cancel()
+                        sequence_choice = None
+                        model_replay = False
+                        combined_choice = False
+                        if actual_mode == 'mouse':
+                            keyboard_choice = None
+                        else:
+                            action = KEYBOARD_ACTION_NAME
+                            x = y = to_x = to_y = COORDINATE_CENTER
+                            cell, spot = position_cell_spot(x, y)
+                            to_cell, variant, demonstration_id = cell, None, None
+                            policy.cancel_pending_decision()
+                        policy.last_decision_source = 'recovery'
+                        policy.last_transfer_used = False
+                        policy.last_action = action
+                        control = None
+                        background = (policy.difference(previous, before)
+                                      if action == KEYBOARD_ACTION_NAME else
+                                      SPOT_CHANGE_WEIGHT * policy.difference(previous, before, cell, spot)
+                                      + REGION_CHANGE_WEIGHT * policy.difference(previous, before, cell)
+                                      + GLOBAL_CHANGE_WEIGHT * policy.difference(previous, before))
                     variant = policy.select_parameter(action, variant, coarse_context)
                     policy.last_cell, policy.last_spot, policy.last_destination = cell, spot, to_cell
                     joint_timing_variant = None
                     joint_lead = None
                     joint_duration_scale = None
+                    self.decisions += 1
+                    attempt = {'session_id': self.session_id, 'decision_id': self.decisions,
+                               'game_id': policy.game_id, 'action': action,
+                               'decision_source': policy.last_decision_source,
+                               'target_identity': before.target_identity,
+                               'frame_id': before.frame_id, 'generation': before.generation,
+                               'bounds': before.bounds, 'from': [x, y], 'to': [to_x, to_y],
+                               'control_key': control_action_key(action, cell, spot,
+                                   keyboard_choice[0] if keyboard_choice else ()),
+                               'demonstration_id': demonstration_id,
+                               'keys': list(keyboard_choice[0]) if keyboard_choice else [],
+                               'status': 'started', 'input_attempted': False, 'input_completed': False,
+                               'state_encoding_version': STATE_ENCODING_VERSION,
+                               'policy_random_state': policy.rng.getstate()}
+                    self.store.event('action_started', attempt)
+                    phase = 'input'
+                    input_started = time.monotonic()
+                    pending_transition = None
                     try:
+                        attempt['input_attempted'] = not self.stop.is_set()
                         if keyboard_choice is not None and combined_choice:
                             joint_timing_variant, joint_lead, joint_duration_scale = joint_timing_learner.choose(
                                 policy.game_id, coarse_context, action, keyboard_choice[0])
@@ -12561,9 +15670,17 @@ class Application:
                             self.native.action(action, x, y, to_x, to_y, self.stop, before.bounds,
                                                variant, policy.last_demonstration_duration if demonstration_id is not None else None,
                                                policy.last_demonstration_path if demonstration_id is not None else "")
+                        attempt['input_completed'] = not self.stop.is_set()
+                    except OSError as error:
+                        pending_transition = self.feedback_transition(root_window, root_owner, window, before, stream)
+                        if pending_transition is None:
+                            raise
+                        attempt['partial_input_error'] = str(error)
                     finally:
+                        phase_times['input'] = time.monotonic() - input_started
                         self.native.active_target_window = None
                         self.native.active_target_owner = None
+                    phase = 'feedback'
                     command_finished = time.monotonic()
                     last_command_finished = command_finished
                     if video_before.motion >= FAST_FEEDBACK_MOTION_THRESHOLD:
@@ -12572,122 +15689,174 @@ class Application:
                         feedback_wait = max(ACTION_SETTLE_SECONDS, reaction or 0.0)
                     if self.stop.wait(feedback_wait):
                         return
-                    if not self.target_matches(window, before.bounds):
-                        raise OSError("操作范围变化，丢弃本次反馈")
-                    captured_after, after_clip = stream.wait_frame(newer_than=command_finished)
-                    if captured_after is None:
-                        return
-                    after_stamp, after = captured_after
-                    if (after.width, after.height, after.bounds) != (before.width, before.height, before.bounds):
-                        policy.prior = None
-                        policy.background_ema = None
-                        previous = None
-                        continue
-                    if (video_before.motion < OBJECTIVE_SCAN_MOTION_THRESHOLD
-                            and policy.difference(before, after) < SNAPSHOT_RECHECK_THRESHOLD):
-                        for delay in ACTION_FEEDBACK_RECHECK_SECONDS:
-                            remaining = command_finished + delay - time.monotonic()
-                            if remaining > 0.0 and self.stop.wait(remaining):
-                                return
-                            if not self.target_matches(window, before.bounds):
-                                raise OSError("操作范围变化，丢弃本次反馈")
-                            checked, checked_clip = stream.wait_frame(newer_than=after_stamp)
-                            if checked is None:
-                                return
-                            checked_stamp, checked_frame = checked
-                            if (checked_frame.width, checked_frame.height, checked_frame.bounds) != (
-                                    before.width, before.height, before.bounds):
-                                break
-                            after_stamp, after, after_clip = checked_stamp, checked_frame, checked_clip
-                            if policy.difference(before, after) >= SNAPSHOT_RECHECK_THRESHOLD:
-                                break
-                    if (not self.target_matches(window, before.bounds)
-                            or not fullscreen and window_owner is not None
-                            and self.native.window_owner(window) != window_owner):
-                        raise OSError("反馈画面不再属于选定游戏窗口，已避免错误学习")
+                    transition = pending_transition or self.feedback_transition(root_window, root_owner, window, before, stream)
+                    transition_details = None
+                    if transition is not None:
+                        window, area, window_owner, transition_details = transition
+                        self.last_target = area
+                        self.last_target_caption = SCOPE_FULLSCREEN if fullscreen else self.native.window_caption(window)
+                        self.observed_game_window, self.observed_game_owner = window, window_owner
+                        self.events.put(('target_info', (self.last_target_caption, area)))
+                        captured_after, after_clip = stream.wait_frame(
+                            newer_than=command_finished, captured_after=command_finished)
+                        if captured_after is None:
+                            return
+                        after_stamp, after = captured_after
+                        self.require_target(window, area, after)
+                        if (after.target_identity != transition_details['after_identity']
+                                or self.native.window_owner(transition_details['root_window']) != transition_details['root_owner']):
+                            raise TargetChanged({'reason': 'feedback_family_changed'})
+                        control = None
+                        attempt['window_transition'] = transition_details
+                        sequence_controller.cancel()
+                        policy.cancel_pending_decision()
+                        self.store.event('action_window_transition', dict(transition_details,
+                            session_id=self.session_id, decision_id=self.decisions))
+                    else:
+                        self.require_target(window, before.bounds, before)
+                        captured_after, after_clip = stream.wait_frame(newer_than=command_finished, captured_after=command_finished)
+                        if captured_after is None:
+                            return
+                        after_stamp, after = captured_after
+                        if (after.target_identity != before.target_identity or
+                                after.generation != before.generation or
+                                not self.target_matches(window, after.bounds, after)):
+                            raise OSError("反馈目标身份变化，重新观察当前窗口")
+                        if (after.width, after.height, after.bounds) != (before.width, before.height, before.bounds):
+                            raise TargetChanged({'reason': 'capture_dimensions_changed',
+                                                 'before_dimensions': [before.width, before.height],
+                                                 'after_dimensions': [after.width, after.height],
+                                                 'expected_bounds': before.bounds, 'actual_bounds': after.bounds})
+                        if (video_before.motion < OBJECTIVE_SCAN_MOTION_THRESHOLD
+                                and policy.difference(before, after) < SNAPSHOT_RECHECK_THRESHOLD):
+                            learned_delay = (reaction if reaction is not None else
+                                             budget.profile()[2])
+                            rechecks = (learned_delay,) if (
+                                command_finished + learned_delay > after_stamp) else ()
+                            for delay in rechecks:
+                                remaining = command_finished + delay - time.monotonic()
+                                if remaining > 0.0 and self.stop.wait(remaining):
+                                    return
+                                self.require_target(window, before.bounds, before)
+                                checked, checked_clip = stream.wait_frame(newer_than=after_stamp)
+                                if checked is None:
+                                    return
+                                checked_stamp, checked_frame = checked
+                                if (checked_frame.target_identity != before.target_identity or
+                                        checked_frame.generation != before.generation):
+                                    raise OSError("复查画面的目标身份变化，重新观察当前窗口")
+                                if (checked_frame.width, checked_frame.height, checked_frame.bounds) != (
+                                        before.width, before.height, before.bounds):
+                                    break
+                                after_stamp, after, after_clip = checked_stamp, checked_frame, checked_clip
+                                if policy.difference(before, after) >= SNAPSHOT_RECHECK_THRESHOLD:
+                                    break
+                        if (not self.target_matches(window, before.bounds, before)
+                                or not fullscreen and window_owner is not None
+                                and self.native.window_owner(window) != window_owner):
+                            raise OSError("反馈画面不再属于选定游戏窗口，已避免错误学习")
                     after_scene = policy.context(after)[1]
                     scene_changed = after_scene != coarse_context
-                    confirmed_outcome = (policy.terminal.observe(after, after_scene, scene_changed)
-                                         if policy.terminal is not None else None)
-                    if (confirmed_outcome is None and policy.terminal is not None
+                    terminal_change = policy.difference(before, after) if transition_details is None else 0.0
+                    confirmed_outcome = (policy.terminal.observe(
+                        after, after_scene, scene_changed, terminal_change)
+                        if policy.terminal is not None else None)
+                    if (transition_details is None and confirmed_outcome is None and policy.terminal is not None
                             and policy.terminal.pending is not None and not self.stop.wait(TERMINAL_CONFIRMATION_DELAY_SECONDS)
-                            and self.target_matches(window, before.bounds)):
+                            and self.target_matches(window, before.bounds, before)):
                         second_capture, second_clip = stream.wait_frame(newer_than=after_stamp)
                         if second_capture is not None:
                             next_stamp, next_frame = second_capture
+                            if (next_frame.target_identity != before.target_identity or
+                                    next_frame.generation != before.generation or
+                                    not self.target_matches(window, next_frame.bounds, next_frame)):
+                                raise OSError("结果确认画面的目标身份变化，重新观察当前窗口")
                             if (next_frame.width, next_frame.height, next_frame.bounds) == (before.width, before.height, before.bounds):
                                 confirmed_outcome = policy.terminal.observe(
-                                    next_frame, policy.context(next_frame)[1], scene_changed)
-                                if confirmed_outcome is not None:
-                                    after_stamp, after, after_clip = next_stamp, next_frame, second_clip
+                                    next_frame, policy.context(next_frame)[1], scene_changed,
+                                    policy.difference(before, next_frame))
+                                after_stamp, after, after_clip = next_stamp, next_frame, second_clip
+                    self.require_target(window, after.bounds, after)
                     response_started = time.monotonic()
+                    phase_times['feedback_wait'] = response_started - command_finished
+                    phase = 'learning'
                     response_samples = stream.frames_between(action_started, after_stamp)
                     onset = None
                     for stamp, moving_frame in response_samples[::max(1, math.ceil(len(response_samples) / TEMPORAL_AFTER_MAX_EVALUATIONS))]:
-                        if (moving_frame.width, moving_frame.height, moving_frame.bounds) == (before.width, before.height, before.bounds):
+                        if transition_details is None and (moving_frame.width, moving_frame.height, moving_frame.bounds) == (before.width, before.height, before.bounds):
                             if policy.difference(before, moving_frame) >= SNAPSHOT_RECHECK_THRESHOLD:
                                 onset = max(0.0, stamp - action_started)
                                 break
                     video_after = TemporalVideo.describe(after_clip, budget.profile()[1])
-                    score, effect, visits = policy.update(
-                        context, cell, spot, action, before, after, background, coarse_context,
-                        to_cell, variant, to_x, to_y, demonstration_id, x, y,
-                        video_before, onset, tuple(frame for stamp, frame in response_samples), video_after,
-                        outcome_hint=confirmed_outcome,
-                        control=(control[0], control[1], after_stamp - before_stamp) if control is not None else None,
-                        keyboard_keys=keyboard_choice[0] if keyboard_choice is not None else ())
+                    if transition_details is not None:
+                        score, effect, visits = policy.update_transition(context, coarse_context,
+                            cell, spot, action, x, y, to_x, to_y, variant, before, after,
+                            keyboard_choice[0] if keyboard_choice else (), video_before, video_after,
+                            confirmed_outcome)
+                    else:
+                        score, effect, visits = policy.update(
+                            context, cell, spot, action, before, after, background, coarse_context,
+                            to_cell, variant, to_x, to_y, demonstration_id, x, y,
+                            video_before, onset, tuple(frame for stamp, frame in response_samples), video_after,
+                            outcome_hint=confirmed_outcome,
+                            control=(control[0], control[1], after_stamp - before_stamp) if control is not None else None,
+                            keyboard_keys=keyboard_choice[0] if keyboard_choice is not None else (),
+                            keyboard_duration=keyboard_choice[1] if keyboard_choice is not None else None)
                     control_mode = ("joint" if combined_choice else
                                     "keyboard" if keyboard_choice is not None else "mouse")
                     if sequence_choice is not None and model_replay:
                         next_coarse = policy.context(after)[1]
                         sequence_controller.feedback(
                             next_coarse, policy.last_goal_feedback, policy.last_outcome, effect)
-                    try:
-                        self.store.record_control_experience(
-                            policy.game_id, coarse_context, control_mode, action, cell, spot,
-                            keyboard_choice[0] if keyboard_choice is not None else (),
-                            score, effect, policy.last_goal_feedback, policy.last_outcome)
-                        if joint_timing_variant is not None:
-                            self.store.record_joint_timing(
-                                policy.game_id, coarse_context, action, keyboard_choice[0],
-                                joint_timing_variant, score, effect,
-                                policy.last_goal_feedback, policy.last_outcome)
-                        decision_mode = policy.last_decision_source
-                        if control_mode == 'keyboard':
-                            decision_mode = 'keyboard'
-                        policy.evolution.learn(policy.game_id, coarse_context, decision_mode,
-                                               score, effect, policy.last_goal_feedback,
-                                               policy.last_outcome)
-                        if control_mode == 'joint':
-                            policy.evolution.learn(policy.game_id, coarse_context, 'joint',
+                    control_trace.append((
+                        policy.game_id, coarse_context, control_mode, action, cell, spot,
+                        ",".join(map(str, sorted(set(keyboard_choice[0]))))
+                        if keyboard_choice is not None else ""))
+                    if transition_details is None or policy.last_outcome is not None:
+                        try:
+                            self.store.defer_write('record_control_experience',
+                                policy.game_id, coarse_context, control_mode, action, cell, spot,
+                                keyboard_choice[0] if keyboard_choice is not None else (),
+                                score, effect, policy.last_goal_feedback, policy.last_outcome)
+                            if joint_timing_variant is not None:
+                                self.store.defer_write('record_joint_timing',
+                                    policy.game_id, coarse_context, action, keyboard_choice[0],
+                                    joint_timing_variant, score, effect,
+                                    policy.last_goal_feedback, policy.last_outcome)
+                            decision_mode = policy.last_decision_source
+                            if control_mode == 'keyboard':
+                                decision_mode = 'keyboard'
+                            policy.evolution.learn(policy.game_id, coarse_context, decision_mode,
                                                    score, effect, policy.last_goal_feedback,
                                                    policy.last_outcome)
-                        if policy.last_outcome is not None:
-                            self.store.credit_control_episode(
-                                policy.game_id, tuple(control_trace),
-                                policy.last_outcome[0], policy.last_outcome[1])
-                        if control_mode == "keyboard":
-                            self.store.keyboard_learn(
-                                policy.game_id, coarse_context, keyboard_choice[0],
-                                score, effect, policy.last_outcome, keyboard_choice[1])
-                        keyboard_learner.observed(
-                            policy.game_id, coarse_context,
-                            keyboard_choice[0] if control_mode == 'keyboard' else (),
-                            score, effect, policy.last_goal_feedback, policy.last_outcome)
-                        if policy.last_outcome is None:
-                            control_trace.append((
-                                policy.game_id, coarse_context, control_mode, action, cell, spot,
-                                ",".join(map(str, sorted(set(keyboard_choice[0]))))
-                                if keyboard_choice is not None else ""))
-                        else:
-                            control_trace.clear()
-                    except sqlite3.Error as error:
-                        self.store.last_error = str(error)
+                            if control_mode == 'joint':
+                                policy.evolution.learn(policy.game_id, coarse_context, 'joint',
+                                                       score, effect, policy.last_goal_feedback,
+                                                       policy.last_outcome)
+                            if policy.last_outcome is not None:
+                                self.store.defer_write('credit_control_episode',
+                                    policy.game_id, tuple(control_trace),
+                                    policy.last_outcome[0], policy.last_outcome[1])
+                            if control_mode == "keyboard":
+                                self.store.keyboard_learn(
+                                    policy.game_id, coarse_context, keyboard_choice[0],
+                                    score, effect, policy.last_outcome, keyboard_choice[1])
+                            keyboard_learner.observed(
+                                policy.game_id, coarse_context,
+                                keyboard_choice[0] if control_mode == 'keyboard' else (),
+                                score, effect, policy.last_goal_feedback, policy.last_outcome)
+                        except sqlite3.Error as error:
+                            self.store.last_error = str(error)
+                        finally:
+                            if policy.last_outcome is not None:
+                                control_trace.clear()
                     response_cost = time.monotonic() - response_started
+                    phase_times['learning_submit_and_feedback'] = response_cost
                     budget.record_reasoning(
                         decision_cost + response_cost,
                         time.monotonic() - decision_started,
-                        max(video_before.motion, video_after.motion))
+                        max(video_before.motion, video_after.motion),
+                        policy.last_goal_feedback, effect if transition_details is None else None)
                     accelerator_failures = 0
                     edge, frame_count, interval, cpu, free = budget.profile()
                     self.vision_edge = edge
@@ -12720,9 +15889,28 @@ class Application:
                     if demonstration_id is not None:
                         self.last_action = "示范·" + self.last_action
                     self.last_frame = after
+                    self.record_action_frames(
+                        {"step": self.steps, "decision_id": self.decisions,
+                         "session_id": self.session_id, "time": utc_stamp(),
+                         "game": policy.game_id, "action": self.last_action,
+                         "mode": control_mode, "decision": policy.last_decision_source,
+                         "effect": effect, "reward": score,
+                         "goal_feedback": policy.last_goal_feedback,
+                         "response_latency": onset, "status": "completed",
+                         "transition": transition_details}, before, after,
+                        force=transition_details is not None or policy.last_outcome is not None or policy.last_goal_feedback is not None)
+                    phase = 'recording'
+                    recording_started = time.monotonic()
                     self.last_selection = None if action == KEYBOARD_ACTION_NAME else (x, y, to_x, to_y, action)
                     self.store.maintain()
                     self.store.event("action", {"index": self.steps, "context": context,
+                                                "session_id": self.session_id,
+                                                "decision_id": self.decisions,
+                                                "before_frame_id": before.frame_id,
+                                                "after_frame_id": after.frame_id,
+                                                "target_identity": before.target_identity,
+                                                "generation": before.generation,
+                                                "phase_seconds": dict(phase_times),
                                                 "coarse_context": coarse_context, "video_signature": video_before.signature,
                                                 "video_frames": video_before.frames, "video_span_seconds": video_before.duration,
                                                 "video_motion": video_before.motion, "video_trend": video_before.trend,
@@ -12731,6 +15919,7 @@ class Application:
                                                 "next_coarse_context": policy.context(after)[1],
                                                 "next_scene_signature": policy.semantic_scene.signature,
                                                 "reward_channels": policy.last_reward_channels,
+                                                "transition": transition_details,
                                                 "decision_latency_seconds": decision_cost,
                                                 "crossgame_prior_available": bool(
                                                     policy.semantic_transfer or policy.episode_transfer
@@ -12775,13 +15964,22 @@ class Application:
                                                 "vision_long_edge": edge, "video_history_frames": frame_count,
                                                 "video_interval_seconds": interval, "cpu_load": cpu,
                                                 **budget.telemetry()})
+                    phase_times['recording'] = time.monotonic() - recording_started
+                    attempt['status'] = 'completed'
                     profile = (edge, frame_count, round(interval, 3), cpu)
-                    if profile != last_reported_profile or self.steps % REPORT_EVERY_STEPS == 0:
+                    if profile != last_reported_profile or self.decisions % REPORT_EVERY_STEPS == 0:
                         self.events.put(("video_profile", profile))
                         last_reported_profile = profile
-                    if self.steps % REPORT_EVERY_STEPS == 0:
+                    if self.decisions % REPORT_EVERY_STEPS == 0:
                         self.events.put(("stats", (self.steps, score, self.last_action, effect, self.no_effect_steps)))
                 except Exception as error:
+                    if attempt is not None:
+                        attempt['error'] = str(error)
+                        attempt['reason'] = (error.details['reason'] if isinstance(error, TargetChanged)
+                                             else type(error).__name__)
+                        if isinstance(error, TargetChanged):
+                            attempt['target_check'] = error.details
+                        attempt['status'] = ('partial_or_failed' if phase == 'input' else 'feedback_invalid')
                     if self.stop.is_set():
                         return
                     self.last_error = traceback.format_exc()
@@ -12803,6 +16001,19 @@ class Application:
                                 stream.target(None)
                         except OSError:
                             stream.target(None)
+                    if isinstance(error, TargetChanged):
+                        recovery_target = (self.native.interaction_window(root_window)
+                                           if not fullscreen and root_window is not None else window)
+                        recovered = (self.native.activate_window(recovery_target)
+                                     if recovery_target is not None else fullscreen)
+                        details = dict(error.details, session_id=self.session_id,
+                                       decision_id=attempt['decision_id'] if attempt else None,
+                                       recovery_action='resolve_popup_and_activate',
+                                       recovery_window=recovery_target, recovery_succeeded=bool(recovered),
+                                       recovery_state=self.target_state(recovery_target,
+                                           self.native.window_bounds(recovery_target)
+                                           if recovery_target is not None else self.native.bounds()))
+                        self.store.event('target_recovery', details)
                     now = time.monotonic()
                     if error_kind != last_reported_error or now - last_error_report >= ERROR_REPORT_SECONDS:
                         self.store.event("recoverable_error", self.last_error)
@@ -12816,19 +16027,78 @@ class Application:
                     if not stream.thread.is_alive() and not self.stop.is_set():
                         stream.close()
                         stream = AdaptiveVideoStream(self.native, self.stop, budget)
-                        stream.target(area, window)
+                        stream.target(area, window, self.native.foreground_identity())
                     try:
                         self.native.release()
                     except Exception:
                         self.store.event("release_error", traceback.format_exc())
+                    phase = 'recovery'
+                    recovery_started = time.monotonic()
                     self.stop.wait(ERROR_RETRY_SECONDS)
+                    phase_times['recovery'] = time.monotonic() - recovery_started
+                finally:
+                    if attempt is not None:
+                        if attempt['status'] == 'started':
+                            attempt['status'] = 'stopped' if self.stop.is_set() else 'feedback_invalid'
+                        attempt['phase'] = phase
+                        attempt['phase_seconds'] = phase_times
+                        attempt['elapsed'] = time.monotonic() - started
+                        attempt['after_frame_id'] = after.frame_id if after is not None else None
+                        attempt['before_dimensions'] = [before.width, before.height] if before else None
+                        attempt['after_dimensions'] = [after.width, after.height] if after else None
+                        recognition = policy.recognition_quality() if attempt['status'] == 'completed' else None
+                        attempt['session_elapsed'] = time.monotonic() - self.started_at
+                        budget.record_cycle(attempt['elapsed'], attempt['status'] == 'completed',
+                                            self.effect if attempt['status'] == 'completed' and not attempt.get('window_transition') else None,
+                                            recognition, max(before.width, before.height) if before else None)
+                        self.store.event('action_finished', attempt)
+                        if attempt['status'] != 'completed' and before is not None:
+                            self.record_action_frames(
+                                dict(attempt, time=utc_stamp(), step=self.steps), before, after, force=True)
+                    stream.end_action()
+                    self.store.defer_write('session_progress', self.session_id,
+                                           time.monotonic() - self.started_at)
         finally:
             self.native.active_target_window = None
             self.native.active_target_owner = None
-            if policy.predictor is not None:
-                policy.predictor.local_model.persist()
-                policy.predictor.global_model.persist()
-            stream.close()
+            try:
+                self.native.release()
+            finally:
+                try:
+                    self.flush_action_frames()
+                finally:
+                    if external_advisor is not None:
+                        external_advisor.close()
+                    stream.end_action()
+                    stream.close()
+
+    def record_action_frames(self, metadata, before, after, force=False):
+        self.latest_action_frames = (dict(metadata), before, after)
+        if force or metadata.get('decision_id', 0) % REPORT_EVERY_STEPS == 0:
+            self.flush_action_frames()
+
+    def flush_action_frames(self):
+        pending = self.latest_action_frames
+        if pending is None:
+            return
+        metadata, before, after = pending
+        key = (metadata.get('session_id'), metadata.get('decision_id'))
+        if self.recent_action_frames:
+            previous = self.recent_action_frames[-1][0]
+            if key == (previous.get('session_id'), previous.get('decision_id')):
+                if all(previous.get(field) == value for field, value in metadata.items()):
+                    return
+                self.recent_action_frames.pop()
+        try:
+            metadata = dict(metadata, after_available=after is not None)
+            detail_evidence = tuple((phase, detail.bounds, detail.frame_id, model_png(detail))
+                for phase, frame in (('before', before), ('after', after)) if frame is not None
+                for detail in frame.details)
+            self.recent_action_frames.append((metadata, model_png(before),
+                                             model_png(after) if after is not None else None, detail_evidence))
+        except (ValueError, MemoryError, OverflowError) as error:
+            if self.store is not None:
+                self.store.last_error = str(error)
 
     def lower_topmost(self):
         if self.root.winfo_exists():
@@ -12875,13 +16145,8 @@ class Application:
             canvas.create_oval(p_x - PREVIEW_ZOOM, p_y - PREVIEW_ZOOM, p_x + PREVIEW_ZOOM, p_y + PREVIEW_ZOOM, outline=UI_ACCENT, width=PREVIEW_ZOOM)
             canvas.create_text(x0, available_height, text="最后动作：" + action, fill=UI_MUTED, anchor="nw")
 
-    def blackbox(self):
-        if self.running or not self.store or self.any_background_worker():
-            return
-        info = {"created": utc_stamp(), "python": sys.version, "platform": sys.platform,
-                "operation_scope": self.operation_scope or self.scope_choice.get(),
-                "stop_key": self.stop_choice.get(), "steps": self.steps, "reward": self.reward, "visual_effect": self.effect, "no_effect_steps": self.no_effect_steps, "last_action": self.last_action, "last_selection": self.last_selection, "last_state_visits": self.visits, "vision_long_edge": self.vision_edge, "vision_process_seconds": self.vision_cost, "video_history_frames": self.video_frames, "video_capture_interval": self.video_interval, "video_motion": self.video_motion, "cpu_utilization": self.video_cpu, "last_error": self.last_error, "database_error": self.store.last_error, "accelerator": self.accelerator_status, "bounds": self.native.bounds(), "target_bounds": self.last_target, "target_caption": self.last_target_caption, "policy": "只输出鼠标与键盘（不模拟停止键）；动态视觉、示范与动作序列学习、跨游戏形态迁移、界面数字/状态条/任务完成证据、资源/道具/等级/对战胜利多目标在线追踪、延迟奖励回溯、目标导向路径规划、失败动作规避与困境恢复；无法验证的结果保持未知；无第三方 AI 模型"}
-        manifest = Path(self.folder.get()) / "dependencies" / ("numpy-" + python_abi()) / ACCELERATOR_METADATA_MARKER
+    def _blackbox_enrich_info(self, info, directory):
+        manifest = directory / "dependencies" / ("numpy-" + python_abi()) / ACCELERATOR_METADATA_MARKER
         if manifest.is_file():
             try:
                 info["accelerator_manifest"] = json.loads(manifest.read_text(encoding="utf-8"))
@@ -13001,29 +16266,67 @@ class Application:
                 for name, updates, examples in neural_counts]
         except sqlite3.Error as error:
             info["strategy_memory_error"] = str(error)
+
+    def ui_diagnostics(self):
+        from tkinter import font as font_module
+        def widget_state(widget):
+            return {'type': widget.winfo_class(), 'geometry': widget.winfo_geometry(),
+                    'actual': [widget.winfo_width(), widget.winfo_height()],
+                    'requested': [widget.winfo_reqwidth(), widget.winfo_reqheight()],
+                    'manager': widget.winfo_manager(), 'mapped': bool(widget.winfo_ismapped())}
+        return {'root': widget_state(self.root), 'screen': [self.root.winfo_screenwidth(), self.root.winfo_screenheight()],
+                'tk_patchlevel': self.root.tk.call('info', 'patchlevel'),
+                'tk_scaling': float(self.root.tk.call('tk', 'scaling')), 'dpi': self.root.winfo_fpixels('1i'),
+                'theme': self.styles.theme_use(), 'layout': self.last_responsive_layout,
+                'widgets': {str(widget): widget_state(widget) for widget in self.layout_widgets},
+                'metrics': [{'tile': widget_state(tile), 'heading': widget_state(heading),
+                             'value': variable.get(), 'label': widget_state(label),
+                             'font': font_module.Font(root=self.root, font=label.cget('font')).actual()}
+                            for tile, heading, (variable, label) in zip(self.metric_tiles, self.metric_headings, self.metric_entries)],
+                'metric_columns': [self.metrics.grid_columnconfigure(index) for index in range(len(self.metric_tiles))],
+                'panel_columns': [self.panels.grid_columnconfigure(index) for index in range(2)]}
+
+    def blackbox(self):
+        if self.running or not self.store or self.any_background_worker():
+            return
+        info = {"created": utc_stamp(), "python": sys.version, "platform": sys.platform,
+                "operation_scope": self.operation_scope or self.scope_choice.get(),
+                "stop_key": self.stop_choice.get(), "ai_model": self.model_choice.get(), "ai_model_status": self.external_model_status, "session_id": self.session_id, "decisions": self.decisions, "steps": self.steps, "reward": self.reward, "visual_effect": self.effect, "no_effect_steps": self.no_effect_steps, "last_action": self.last_action, "last_selection": self.last_selection, "last_state_visits": self.visits, "vision_long_edge": self.vision_edge, "vision_process_seconds": self.vision_cost, "video_history_frames": self.video_frames, "video_capture_interval": self.video_interval, "video_motion": self.video_motion, "cpu_utilization": self.video_cpu, "last_error": self.last_error, "database_error": self.store.last_error, "accelerator": self.accelerator_status, "bounds": self.native.bounds(), "target_bounds": self.last_target, "target_caption": self.last_target_caption, "policy": "只输出鼠标与键盘（不模拟停止键）；动态视觉、示范与动作序列学习、跨游戏形态迁移、界面数字/状态条/任务完成证据、资源/道具/等级/对战胜利多目标在线追踪、延迟奖励回溯、目标导向路径规划、失败动作规避与困境恢复；无法验证的结果保持未知；仅当用户选择外部模型时访问第三方模型"}
+        info["ui_diagnostics"] = self.ui_diagnostics()
+        info["session_elapsed_seconds"] = self.finished_elapsed
+        info["state_encoding_version"] = STATE_ENCODING_VERSION
         evaluation = None
-        try:
-            evaluation = self.store.evaluation_snapshot()
-            info["replayable_evaluation"] = {
-                "events": evaluation["events"], "totals": evaluation["totals"],
-                "coverage": evaluation["coverage"]}
-        except (sqlite3.Error, ValueError, TypeError) as error:
-            info["evaluation_error"] = str(error)
-        info["mouse_observation_hook"] = (
-            "enabled" if self.observer.hook_installed else
-            self.observer.hook_error if self.observer.hook_error else "inactive")
         preview = self.last_frame.ppm() if self.last_frame else None
+        frame_history = tuple(self.recent_action_frames)
         self.blackbox_button.configure(state="disabled")
         self.start_button.configure(state="disabled")
         self.folder_button.configure(state="disabled")
-        self.status.set("正在生成黑匣子…")
+        self.export_active = True
+        self.observer.activate(False)
+        self.download_percent.set(0.0)
+        if not self.download_bar.winfo_manager():
+            self.download_bar.grid()
+        self.status.set("正在生成黑匣子 · 准备中")
         store = self.store
+        directory = Path(self.folder.get())
         def worker():
             try:
-                target = store.export(self.native.desktop(), info, preview, evaluation)
+                self.events.put(("export_progress", ("正在汇总学习与历史记录", 0)))
+                store.flush_learning()
+                if store.neural_service is not None:
+                    info['background_learning'] = store.neural_service.telemetry()
+                if store.write_service is not None:
+                    info['background_storage'] = store.write_service.telemetry()
+                self._blackbox_enrich_info(info, directory)
+                target = store.export(self.native.desktop(), info, preview, evaluation,
+                                      frame_history,
+                                      progress=lambda stage, percent: self.events.put(
+                                          ("export_progress", (stage, percent))),
+                                      native=self.native)
                 message = "黑匣子已保存到桌面：" + str(target)
             except Exception as error:
                 message = "黑匣子导出失败：" + str(error)
+                self.last_error = traceback.format_exc()
             self.events.put(("export_finished", message))
         self.export_worker = threading.Thread(target=worker, daemon=True, name="blackbox-export")
         self.export_worker.start()
@@ -13048,13 +16351,12 @@ class Application:
         if scope == SCOPE_FULLSCREEN:
             target = "全屏范围：" + str(self.native.bounds())
         elif scope == SCOPE_WINDOW:
-            hwnd = self.window_options.get(self.window_choice.get())
-            area = self.native.window_bounds(hwnd) if hwnd is not None else None
+            hwnd, area = self.native.foreground_window(self.root.winfo_id())
             if area is None:
-                target = "目标窗口：请选择一个可用窗口"
+                target = "窗口范围：自动寻找可用的前台窗口"
             else:
                 caption = self.native.window_caption(hwnd) or self.native.window_class(hwnd)
-                target = "目标窗口：" + caption[:WINDOW_DISPLAY_NAME_LIMIT] + " · " + str(area)
+                target = "窗口范围：" + caption[:WINDOW_DISPLAY_NAME_LIMIT] + " · " + str(area)
         else:
             target = "操作目标：尚未选择"
         if target != self.last_target_preview:
@@ -13070,8 +16372,7 @@ class Application:
             if current - self.last_target_preview_check >= UI_TARGET_DISCOVERY_SECONDS:
                 self.last_target_preview_check = current
                 try:
-                    if self.scope_choice.get() == SCOPE_WINDOW:
-                        self.refresh_window_list()
+                    self.observe_foreground()
                     self.update_target_preview()
                 except OSError as error:
                     self.log("目标窗口识别暂不可用：" + str(error))
@@ -13080,7 +16381,7 @@ class Application:
                 try:
                     key = self.configured_stop_code
                     if key is not None and self.native.user.GetAsyncKeyState(key) & (KEY_DOWN_MASK | KEY_PRESSED_MASK):
-                        self.stop.set()
+                        self.guard.signal_stop()
                 except Exception:
                     pass
             if not self.running or not self.stop.is_set():
@@ -13115,12 +16416,15 @@ class Application:
                 self.preparing = False
                 self.base_steps = 0
                 self.steps = 0
+                self.decisions = 0
+                self.latest_action_frames = None
                 self.reward = 0.0
                 self.effect = 0.0
                 self.visits = 0
                 self.no_effect_steps = 0
                 self.last_action = "—"
                 self.last_frame = None
+                self.recent_action_frames.clear()
                 self.last_selection = None
                 self.preview_source = None
                 self.preview_image = None
@@ -13128,6 +16432,8 @@ class Application:
                 self.reward_text.set("0.0000")
                 self.action_text.set("—")
                 self.no_effect_text.set("0")
+                self.started_at = None
+                self.finished_elapsed = 0.0
                 self.runtime_text.set("00:00")
                 self.rate_text.set("0.0/分")
                 self.draw_preview()
@@ -13141,7 +16447,7 @@ class Application:
                 self.log("数据目录就绪：" + directory)
                 self.accelerator_cancel.set()
                 self.accelerator_generation += 1
-                self.download_bar.pack_forget()
+                self.download_bar.grid_remove()
                 self.download_percent.set(0.0)
             elif kind == "store_failed":
                 self.observer.activate(self.store is not None)
@@ -13150,14 +16456,16 @@ class Application:
                 self.log("数据目录初始化失败：" + content)
             elif kind == "accelerator":
                 generation, stage, message, percent = content
+                if self.export_active:
+                    continue
                 if generation == self.accelerator_generation:
                     self.accelerator_status = stage + " · " + message
                     if stage == "downloading":
                         self.download_percent.set(percent if percent is not None else 0)
                         if not self.download_bar.winfo_manager():
-                            self.download_bar.pack(fill="x", pady=(0, UI_SPACING_XS), before=self.folder_row)
+                            self.download_bar.grid()
                     elif self.download_bar.winfo_manager():
-                        self.download_bar.pack_forget()
+                        self.download_bar.grid_remove()
                     if stage in ("ready", "fallback"):
                         if not self.running and not self.preparing:
                             self.status.set("一切就绪 · " + message)
@@ -13198,6 +16506,9 @@ class Application:
             elif kind == "target_info":
                 caption, area = content
                 self.target_text.set("自动目标：" + (caption if caption else "等待可用窗口") + " · " + (str(area) if area else "尚未定位"))
+            elif kind == "model_status":
+                self.external_model_status = content
+                self.log(content)
             elif kind == "agent_error":
                 self.log("Agent 自动恢复：" + content)
             elif kind == "agent_finished":
@@ -13229,25 +16540,36 @@ class Application:
                 self.no_effect_text.set(str(self.no_effect_steps))
                 self.show_preview()
                 if self.started_at is not None:
-                    elapsed = int(time.monotonic() - self.started_at)
+                    elapsed = int(self.finished_elapsed)
                     self.runtime_text.set(f"{elapsed // SECONDS_PER_MINUTE:02d}:{elapsed % SECONDS_PER_MINUTE:02d}")
+                    self.rate_text.set(f"{self.steps * SECONDS_PER_MINUTE / max(SPEED_TIME_FLOOR_SECONDS, self.finished_elapsed):.1f}/分")
                     self.started_at = None
                 self.status.set(f"已停止 · 本次 {self.steps} 次操作 · 最新视觉奖励 {self.reward:+.4f}")
                 self.log("已停止；鼠标已释放；目标窗口：" + (self.last_target_caption or "未定位"))
+            elif kind == "export_progress":
+                if self.export_active:
+                    stage, percent = content
+                    self.download_percent.set(percent)
+                    self.status.set(f"黑匣子 · {stage} · {percent}%")
+                    self.root.title(f"{APP_NAME} · 黑匣子 {percent}%")
             elif kind == "export_finished":
+                self.root.title(APP_NAME)
+                self.export_active = False
+                self.observer.activate(True)
+                self.download_bar.grid_remove()
+                self.download_percent.set(0.0)
                 self.status.set(content)
                 self.log(content)
         ready = self.store is not None and not self.preparing and self.guard.ready.is_set() and self.guard.thread.is_alive()
         can_control = not self.running and not self.preparing and not self.any_background_worker()
-        configured = self.scope_choice.get() in SCOPE_OPTIONS and self.stop_choice.get() in STOP_KEY_CODES
-        if self.scope_choice.get() == SCOPE_WINDOW:
-            hwnd = self.window_options.get(self.window_choice.get())
-            configured = configured and hwnd is not None and self.native.window_bounds(hwnd) is not None
+        configured = (self.scope_choice.get() in SCOPE_OPTIONS
+                      and self.model_choice.get() in AI_MODEL_OPTIONS
+                      and self.stop_choice.get() in STOP_KEY_CODES)
         self.start_button.configure(state="normal" if ready and can_control and configured else "disabled")
         self.blackbox_button.configure(state="normal" if self.store is not None and can_control else "disabled")
         self.folder_button.configure(state="normal" if can_control else "disabled")
+        self.model_selector.configure(state="readonly" if self.store is not None and can_control else "disabled")
         self.scope_selector.configure(state="readonly" if self.store is not None and can_control else "disabled")
-        self.window_selector.configure(state="readonly" if self.store is not None and can_control and self.scope_choice.get() == SCOPE_WINDOW else "disabled")
         self.stop_selector.configure(state="readonly" if self.store is not None and can_control else "disabled")
         if self.store is not None and not self.running and not self.preparing and not self.guard.ready.is_set():
             self.status.set("等待键盘停止监听准备完成…")
@@ -13255,7 +16577,7 @@ class Application:
             self.start_button.configure(state="disabled")
             self.status.set("键盘停止监听不可用，无法启动 Agent")
         if self.started_at is not None:
-            elapsed = time.monotonic() - self.started_at
+            elapsed = self.session_elapsed()
             elapsed_seconds = int(elapsed)
             self.runtime_text.set(f"{elapsed_seconds // SECONDS_PER_MINUTE:02d}:{elapsed_seconds % SECONDS_PER_MINUTE:02d}")
             self.rate_text.set(f"{self.steps * SECONDS_PER_MINUTE / max(SPEED_TIME_FLOOR_SECONDS, elapsed):.1f}/分")
@@ -13267,6 +16589,17 @@ class Application:
                 self.step_text.set(str(max(total, self.base_steps + self.steps)))
             except sqlite3.Error as error:
                 self.log("读取统计失败：" + str(error))
+        self.responsive_layout()
+        self.fit_metrics()
+
+    def session_elapsed(self):
+        if not self.running:
+            return self.finished_elapsed
+        if self.started_at is None:
+            return 0.0
+        stopped_at = getattr(self.guard, 'stopped_at', None)
+        end = stopped_at if self.stop.is_set() and stopped_at is not None else time.monotonic()
+        return max(0.0, end - self.started_at)
 
     def recover_agent_worker(self):
         if self.running and self.stop.is_set():
